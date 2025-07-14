@@ -7,6 +7,7 @@ import subprocess
 from mockbuild.trace_decorator import traceLog
 import hashlib
 import re
+import socket
 
 requires_api_version = "1.1"  # Ensure compatibility with mock API
 
@@ -89,7 +90,17 @@ class SBOMGenerator(object):
                 print("No RPM, source RPM, or spec file found for SBOM generation.")
                 return
 
+            # Gather SBOM document metadata
+            sbom_metadata = {
+                "sbom_format_version": "0.9",
+                "created_by": "mock-sbom-generator 0.9",
+                "created": self.get_iso_timestamp(),
+                "build_host": socket.gethostname(),
+                "distribution": self.get_distribution()
+            }
+
             sbom = {
+                "sbom_metadata": sbom_metadata,
                 "SPDXVersion": "SPDX-2.3",
                 "DataLicense": "CC0-1.0",
                 "SPDXID": "SPDXRef-DOCUMENT",
@@ -113,7 +124,7 @@ class SBOMGenerator(object):
                     "source_files": []
                 }
 
-            build_environment = self.get_build_environment_packages()
+            build_toolchain = self.get_build_toolchain_packages()
 
             # Process binary RPMs
             for rpm_file in rpm_files:
@@ -133,21 +144,34 @@ class SBOMGenerator(object):
                             "group": info.get("group")
                         })
                     dependencies = self.get_rpm_dependencies(rpm_path)
+                    package_name = package_data.get("name")
+                    package_version = package_data.get("version")
+                    spdx_id = self.generate_spdx_id(package_name, package_version, "Package")
+                    cpe = self.generate_cpe(package_name, package_version)
+                    # Format originator according to SPDX standard
+                    vendor = package_data.get("vendor")
+                    if vendor and vendor != "(none)":
+                        originator = f"Organization: {vendor}"
+                    else:
+                        originator = None
+                    
                     sbom_package = {
-                        "name": package_data.get("name"),
-                        "version": package_data.get("version"),
+                        "SPDXID": spdx_id,
+                        "name": package_name,
+                        "version": package_version,
                         "release": package_data.get("release"),
-                        "license": package_data.get("license"),
-                        "vendor": package_data.get("vendor"),
+                        "licenseDeclared": package_data.get("license"),
+                        "originator": originator,
                         "url": package_data.get("url"),
                         "packager": package_data.get("packager"),
                         "files": files_with_info,
                         "dependencies": dependencies,
                         "gpg_signature": None,
+                        "cpe": cpe
                     }
                     sbom["packages"].append(sbom_package)
 
-            sbom["build_environment"] = build_environment
+            sbom["build_toolchain"] = build_toolchain
 
             with open(out_file, "w") as f:
                 json.dump(sbom, f, indent=4)
@@ -249,25 +273,147 @@ class SBOMGenerator(object):
         from datetime import datetime
         return datetime.utcnow().isoformat() + "Z"
 
-    def get_build_environment_packages(self):
-        """Returns the list of packages installed in the build environment with detailed signature information."""
+    def get_distribution(self):
+        """Returns the distribution name and version from /etc/os-release."""
+        try:
+            distro = None
+            version = None
+            if os.path.exists("/etc/os-release"):
+                with open("/etc/os-release") as f:
+                    for line in f:
+                        if line.startswith("NAME="):
+                            distro = line.strip().split("=", 1)[1].strip('"')
+                        elif line.startswith("VERSION_ID="):
+                            version = line.strip().split("=", 1)[1].strip('"')
+            if distro and version:
+                return f"{distro} {version}"
+            elif distro:
+                return distro
+            else:
+                return "Unknown"
+        except Exception as e:
+            return f"Unknown ({e})"
+
+    def generate_spdx_id(self, package_name, package_version, package_type="Package"):
+        """Generates a unique SPDX ID for a package."""
+        # Sanitize package name and version for SPDX ID format
+        # SPDX IDs must start with a letter and contain only letters, numbers, dots, and hyphens
+        sanitized_name = re.sub(r'[^a-zA-Z0-9.-]', '-', package_name)
+        sanitized_version = re.sub(r'[^a-zA-Z0-9.-]', '-', package_version)
+        
+        # Ensure it starts with a letter
+        if sanitized_name and not sanitized_name[0].isalpha():
+            sanitized_name = "pkg-" + sanitized_name
+        
+        # Create the SPDX ID
+        spdx_id = f"SPDXRef-{package_type}-{sanitized_name}-{sanitized_version}"
+        return spdx_id
+
+    def generate_cpe(self, package_name, package_version, vendor=None):
+        """Generates a CPE identifier for a package."""
+        # CPE format: cpe:2.3:a:{vendor}:{product}:{version}:*:*:*:*:*:*:*:*
+        
+        # Default vendor if not provided
+        if not vendor or vendor == "(none)":
+            vendor = "fedora"
+        
+        # Clean up vendor name for CPE
+        vendor = re.sub(r'[^a-zA-Z0-9._-]', '_', vendor.lower())
+        
+        # Clean up package name for CPE
+        product = re.sub(r'[^a-zA-Z0-9._-]', '_', package_name.lower())
+        
+        # Clean up version for CPE (remove release part if present)
+        version = package_version
+        if '-' in version:
+            version = version.split('-')[0]  # Remove release part
+        
+        # Handle special cases for common packages
+        if package_name == "glibc":
+            vendor = "gnu"
+            product = "glibc"
+        elif package_name == "openssl":
+            vendor = "openssl"
+            product = "openssl"
+        elif package_name == "gcc":
+            vendor = "gnu"
+            product = "gcc"
+        elif package_name == "make":
+            vendor = "gnu"
+            product = "make"
+        elif package_name == "gettext":
+            vendor = "gnu"
+            product = "gettext"
+        
+        # Generate CPE
+        cpe = f"cpe:2.3:a:{vendor}:{product}:{version}:*:*:*:*:*:*:*:*"
+        return cpe
+
+    def detect_chroot_distribution(self):
+        """Detects the distribution name inside the chroot by reading /etc/os-release."""
+        try:
+            # Use buildroot's doChroot to cat /etc/os-release
+            cmd = ["cat", "/etc/os-release"]
+            output, _ = self.buildroot.doChroot(cmd, shell=False, returnOutput=True, printOutput=False)
+            distro = None
+            if output:
+                for line in output.splitlines():
+                    if line.startswith("ID="):
+                        distro = line.strip().split("=", 1)[1].strip('"').lower()
+                        break
+            if distro:
+                return distro
+            else:
+                return "unknown"
+        except Exception as e:
+            print(f"Failed to detect chroot distribution: {e}")
+            return "unknown"
+
+    def get_build_toolchain_packages(self):
+        """Returns the list of packages installed in the build toolchain with detailed signature information."""
         try:
             import subprocess
             import shlex
             
-            # Get basic package information from host using rpm --root
+            # Try to get package information from host using rpm --root first
+            # If that fails, fall back to running inside the chroot
             root_path = self.buildroot.rootdir
-            cmd = f"rpm --root {shlex.quote(root_path)} -qa --qf '%{{NAME}} %{{VERSION}}-%{{RELEASE}}.%{{ARCH}} %{{LICENSE}}\\n'"
+            cmd = f"rpm --root {shlex.quote(root_path)} -qa --qf '%{{NAME}}|%{{VERSION}}-%{{RELEASE}}.%{{ARCH}}|%{{LICENSE}}\n'"
             result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             output = result.stdout
+            
+            # If host rpm command failed (empty output), try running inside chroot
+            if not output.strip():
+                print("Host RPM command failed, trying inside chroot...")
+                # Use buildroot's doChroot method to run the command inside the chroot
+                cmd = ["rpm", "-qa", "--qf", "%{NAME}|%{VERSION}-%{RELEASE}.%{ARCH}|%{LICENSE}\n"]
+                output, _ = self.buildroot.doChroot(cmd, shell=False, returnOutput=True, printOutput=False)
+                print(f"Chroot command output length: {len(output)}")
+
+            # Detect chroot distribution for CPE vendor default
+            cpe_vendor_default = self.detect_chroot_distribution()
+            
             packages = []
             
             for line in output.splitlines():
-                parts = line.split()
-                if len(parts) >= 3:
-                    package_name = parts[0]
-                    package_version = parts[1]
-                    package_license = parts[2] if len(parts) > 2 else None
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                # Split by delimiter and handle edge cases
+                parts = line.split('|')
+                if len(parts) >= 2:
+                    package_name = parts[0].strip()
+                    package_version = parts[1].strip()
+                    package_license = parts[2].strip() if len(parts) > 2 else None
+                    
+                    # Skip GPG keys and other non-package entries
+                    if package_name.startswith('gpg-pubkey') or package_name == '(none)':
+                        continue
+                    
+                    # Skip empty package names
+                    if not package_name:
+                        continue
                     
                     # Get detailed signature information for this package
                     digital_signature = self.get_package_detailed_signature(package_name)
@@ -280,13 +426,19 @@ class SBOMGenerator(object):
                             "error": "Failed to get signature information"
                         }
                     
+                    spdx_id = self.generate_spdx_id(package_name, package_version, "BuildEnv")
+                    # Use detected distro as vendor if vendor is missing
+                    cpe = self.generate_cpe(package_name, package_version, vendor=cpe_vendor_default)
                     packages.append({
+                        "SPDXID": spdx_id,
                         "name": package_name,
                         "version": package_version,
-                        "license": package_license,
-                        "digital_signature": digital_signature
+                        "licenseDeclared": package_license,
+                        "digital_signature": digital_signature,
+                        "cpe": cpe
                     })
             
+            print(f"Found {len(packages)} build toolchain packages")
             return packages
             
         except Exception as e:
@@ -298,11 +450,19 @@ class SBOMGenerator(object):
         try:
             import subprocess
             import shlex
-            # Use rpm --root to query from outside the chroot to preserve signature info
+            # Try to use rpm --root to query from outside the chroot first
+            # If that fails, fall back to running inside the chroot
             root_path = self.buildroot.rootdir
             cmd = f"rpm --root {shlex.quote(root_path)} -qi {shlex.quote(package_name)}"
             result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             output = result.stdout
+            
+            # If host rpm command failed (empty output), try running inside chroot
+            if not output.strip():
+                print(f"Host RPM command failed for {package_name}, trying inside chroot...")
+                # Use buildroot's doChroot method to run the command inside the chroot
+                cmd = ["rpm", "-qi", package_name]
+                output, _ = self.buildroot.doChroot(cmd, shell=False, returnOutput=True, printOutput=False)
             
             signature_info = {
                 "signature_type": None,
