@@ -372,115 +372,74 @@ class SBOMGenerator(object):
     def get_build_toolchain_packages(self):
         """Returns the list of packages installed in the build toolchain with detailed signature information."""
         try:
-            import subprocess
-            import shlex
-            
-            # Try to get package information from host using rpm --root first
-            # If that fails, fall back to running inside the chroot
-            root_path = self.buildroot.rootdir
-            cmd = f"rpm --root {shlex.quote(root_path)} -qa --qf '%{{NAME}}|%{{VERSION}}-%{{RELEASE}}.%{{ARCH}}|%{{LICENSE}}\n'"
-            result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            output = result.stdout
-            
-            # If host rpm command failed (empty output), try running inside chroot
-            if not output.strip():
-                print("Host RPM command failed, trying inside chroot...")
-                # Use buildroot's doChroot method to run the command inside the chroot
-                cmd = ["rpm", "-qa", "--qf", "%{NAME}|%{VERSION}-%{RELEASE}.%{ARCH}|%{LICENSE}\n"]
-                output, _ = self.buildroot.doChroot(cmd, shell=False, returnOutput=True, printOutput=False)
-                print(f"Chroot command output length: {len(output)}")
-
-            # Detect chroot distribution for CPE vendor default
-            cpe_vendor_default = self.detect_chroot_distribution()
-            
+            # First get basic package info
+            query = "%{NAME}|%{VERSION}-%{RELEASE}.%{ARCH}|%{LICENSE}|%{BUILDTIME}\n"
+            cmd = ["rpm", "-qa", "--qf", query]
+            output, _ = self.buildroot.doChroot(cmd, shell=False, returnOutput=True, printOutput=False)
             packages = []
+            cpe_vendor_default = self.detect_chroot_distribution() or "unknown"
+            import re
+            import datetime
             
             for line in output.splitlines():
-                line = line.strip()
-                if not line:
+                parts = line.split("|", 3)
+                if len(parts) < 3:
                     continue
-                    
-                # Split by delimiter and handle edge cases
-                parts = line.split('|')
-                if len(parts) >= 2:
-                    package_name = parts[0].strip()
-                    package_version = parts[1].strip()
-                    package_license = parts[2].strip() if len(parts) > 2 else None
-                    
-                    # Skip GPG keys and other non-package entries
-                    if package_name.startswith('gpg-pubkey') or package_name == '(none)':
-                        continue
-                    
-                    # Skip empty package names
-                    if not package_name:
-                        continue
-                    
-                    # Get detailed signature information for this package
-                    digital_signature = self.get_package_detailed_signature(package_name)
-                    
-                    # Ensure we always have a valid signature structure
-                    if digital_signature is None:
-                        digital_signature = {
-                            "signature_type": "unknown",
-                            "signature_valid": False,
-                            "error": "Failed to get signature information"
-                        }
-                    
-                    spdx_id = self.generate_spdx_id(package_name, package_version, "BuildEnv")
-                    # Use detected distro as vendor if vendor is missing
-                    cpe = self.generate_cpe(package_name, package_version, vendor=cpe_vendor_default)
-                    packages.append({
-                        "SPDXID": spdx_id,
-                        "name": package_name,
-                        "version": package_version,
-                        "licenseDeclared": package_license,
-                        "digital_signature": digital_signature,
-                        "cpe": cpe
-                    })
-            
+                package_name = parts[0].strip()
+                package_version = parts[1].strip()
+                package_license = parts[2].strip()
+                build_time = parts[3].strip() if len(parts) > 3 else None
+                
+                # Skip GPG keys and other non-package entries
+                if package_name.startswith('gpg-pubkey') or package_name == '(none)' or not package_name:
+                    continue
+                
+                # Get detailed signature info for this package
+                digital_signature = self.get_package_signature_from_chroot(package_name)
+                
+                # Build date
+                if build_time and build_time.isdigit():
+                    try:
+                        dt = datetime.datetime.utcfromtimestamp(int(build_time))
+                        digital_signature["build_date"] = dt.isoformat() + "Z"
+                    except Exception:
+                        digital_signature["build_date"] = None
+                
+                spdx_id = self.generate_spdx_id(package_name, package_version, "BuildEnv")
+                cpe = self.generate_cpe(package_name, package_version, vendor=cpe_vendor_default)
+                packages.append({
+                    "SPDXID": spdx_id,
+                    "name": package_name,
+                    "version": package_version,
+                    "licenseDeclared": package_license,
+                    "digital_signature": digital_signature,
+                    "cpe": cpe
+                })
             print(f"Found {len(packages)} build toolchain packages")
             return packages
-            
         except Exception as e:
             print(f"Failed to get build environment packages: {e}")
             return []
 
-    def get_package_detailed_signature(self, package_name):
-        """Gets detailed signature information for a specific package."""
+    def get_package_signature_from_chroot(self, package_name):
+        """Gets detailed signature information for a specific package from inside the chroot."""
         try:
-            import subprocess
-            import shlex
-            # Try to use rpm --root to query from outside the chroot first
-            # If that fails, fall back to running inside the chroot
-            root_path = self.buildroot.rootdir
-            cmd = f"rpm --root {shlex.quote(root_path)} -qi {shlex.quote(package_name)}"
-            result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            output = result.stdout
-            
-            # If host rpm command failed (empty output), try running inside chroot
-            if not output.strip():
-                print(f"Host RPM command failed for {package_name}, trying inside chroot...")
-                # Use buildroot's doChroot method to run the command inside the chroot
-                cmd = ["rpm", "-qi", package_name]
-                output, _ = self.buildroot.doChroot(cmd, shell=False, returnOutput=True, printOutput=False)
+            cmd = ["rpm", "-qi", package_name]
+            output, _ = self.buildroot.doChroot(cmd, shell=False, returnOutput=True, printOutput=False)
             
             signature_info = {
-                "signature_type": None,
+                "signature_type": "unsigned",
                 "signature_key": None,
                 "signature_date": None,
                 "signature_algorithm": None,
-                "signature_valid": None,
+                "signature_valid": False,
                 "raw_signature_data": None,
                 "build_date": None
             }
             
-            output_lines = output.splitlines()
-            i = 0
-            signature_found = False
-            while i < len(output_lines):
-                line = output_lines[i].strip()
+            for line in output.splitlines():
+                line = line.strip()
                 if line.startswith("Signature"):
-                    signature_found = True
                     # Extract the signature data after the colon
                     sig_data = line.split(":", 1)[1].strip() if ":" in line else ""
                     signature_info["raw_signature_data"] = sig_data
@@ -506,7 +465,91 @@ class SBOMGenerator(object):
                                 signature_info["signature_key"] = key_id_match.group(1)
                         
                         # Extract date - handle various time formats including EST/EDT
-                        date_match = re.search(r'([A-Za-z]{3} \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} [A-Z]{2,3} [A-Z]{3,4})', sig_data)
+                        date_match = re.search(r'([A-Za-z]{3} [A-Za-z]{3}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4})', sig_data)
+                        if date_match:
+                            signature_info["signature_date"] = date_match.group(1)
+                    else:
+                        signature_info["signature_type"] = "unsigned"
+                        signature_info["signature_valid"] = False
+                    break
+            
+            return signature_info
+            
+        except Exception as e:
+            print(f"Failed to get signature for package {package_name}: {e}")
+            return {
+                "signature_type": "unknown",
+                "signature_valid": False,
+                "error": str(e)
+            }
+
+    def get_package_detailed_signature(self, package_name):
+        """Gets detailed signature information for a specific package."""
+        try:
+            import subprocess
+            import shlex
+            # Try to use rpm --root to query from outside the chroot first
+            # If that fails, fall back to running inside the chroot
+            root_path = self.buildroot.rootdir
+            cmd = f"rpm --root {shlex.quote(root_path)} -qi {shlex.quote(package_name)}"
+            result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            output = result.stdout
+            
+            # If host rpm command failed (empty output), try running inside chroot
+            if not output.strip():
+                print(f"Host RPM command failed for {package_name}, trying inside chroot...")
+                # Use buildroot's doChroot method to run the command inside the chroot
+                cmd = ["rpm", "-qi", package_name]
+                output, _ = self.buildroot.doChroot(cmd, shell=False, returnOutput=True, printOutput=False)
+                print(f"Chroot RPM output for {package_name}: {output[:200]}...")  # Debug output
+            
+            signature_info = {
+                "signature_type": None,
+                "signature_key": None,
+                "signature_date": None,
+                "signature_algorithm": None,
+                "signature_valid": None,
+                "raw_signature_data": None,
+                "build_date": None
+            }
+            
+            output_lines = output.splitlines()
+            i = 0
+            signature_found = False
+            print(f"DEBUG: Processing {len(output_lines)} lines for package {package_name}")
+            while i < len(output_lines):
+                line = output_lines[i].strip()
+                print(f"DEBUG: Line {i}: '{line}'")
+                if line.startswith("Signature"):
+                    signature_found = True
+                    print(f"DEBUG: Found signature line: '{line}'")
+                    # Extract the signature data after the colon
+                    sig_data = line.split(":", 1)[1].strip() if ":" in line else ""
+                    signature_info["raw_signature_data"] = sig_data
+                    print(f"DEBUG: Extracted signature data: '{sig_data}'")
+                    
+                    if sig_data and sig_data != "(none)" and sig_data != "":
+                        signature_info["signature_type"] = "GPG"
+                        signature_info["signature_valid"] = True
+                        
+                        # Parse signature line like: "RSA/SHA256, Fri 08 Nov 2024 03:56:24 AM EST, Key ID c8ac4916105ef944"
+                        if "RSA/SHA256" in sig_data:
+                            signature_info["signature_algorithm"] = "RSA/SHA256"
+                        elif "DSA/SHA1" in sig_data:
+                            signature_info["signature_algorithm"] = "DSA/SHA1"
+                        elif "ECDSA/SHA256" in sig_data:
+                            signature_info["signature_algorithm"] = "ECDSA/SHA256"
+                        elif "Ed25519/SHA256" in sig_data:
+                            signature_info["signature_algorithm"] = "Ed25519/SHA256"
+                        
+                        # Extract key ID
+                        if "Key ID" in sig_data:
+                            key_id_match = re.search(r'Key ID ([0-9a-fA-F]+)', sig_data)
+                            if key_id_match:
+                                signature_info["signature_key"] = key_id_match.group(1)
+                        
+                        # Extract date - handle various time formats including EST/EDT
+                        date_match = re.search(r'([A-Za-z]{3} [A-Za-z]{3}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4})', sig_data)
                         if date_match:
                             signature_info["signature_date"] = date_match.group(1)
                     else:
