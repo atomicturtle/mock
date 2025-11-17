@@ -9,6 +9,9 @@ import hashlib
 import re
 import socket
 import uuid
+import tempfile
+import shutil
+import shlex
 
 requires_api_version = "1.1"  # Ensure compatibility with mock API
 
@@ -90,7 +93,7 @@ class SBOMGenerator(object):
                 {
                     "vendor": "Mock",
                     "name": "mock-sbom-generator",
-                    "version": "0.11"
+                            "version": "1.0"
                 }
             ],
             "properties": []
@@ -152,7 +155,7 @@ class SBOMGenerator(object):
             return
 
         out_file = os.path.join(self.buildroot.resultdir, 'sbom.cyclonedx.json')
-        state_text = "Generating CycloneDX SBOM for built packages v0.11"
+        state_text = "Generating CycloneDX SBOM for built packages v1.0"
         self.state.start(state_text)
 
         try:
@@ -186,10 +189,30 @@ class SBOMGenerator(object):
             
             # Process source files from spec file
             source_files = []
+            source_component_entries = []
+            build_subject_name = None
+            build_subject_version = None
+            build_subject_release = None
+
             if spec_file:
+                build_subject_name = os.path.splitext(os.path.basename(spec_file))[0]
                 parsed_sources = self.parse_spec_file(spec_file)
-                source_files = parsed_sources
-            elif src_rpm_files:
+                if parsed_sources:
+                    source_files = parsed_sources
+
+            srpm_metadata = None
+            if src_rpm_files:
+                srpm_path = os.path.join(build_dir, src_rpm_files[0])
+                srpm_metadata = self.get_rpm_metadata(srpm_path)
+                if srpm_metadata:
+                    if not build_subject_name:
+                        build_subject_name = srpm_metadata.get("name")
+                    if not build_subject_version:
+                        build_subject_version = srpm_metadata.get("version")
+                    if not build_subject_release:
+                        build_subject_release = srpm_metadata.get("release")
+
+            if not source_files and src_rpm_files:
                 # Extract from source RPM if available
                 src_rpm_path = os.path.join(build_dir, src_rpm_files[0])
                 source_files = self.extract_source_files_from_srpm(src_rpm_path)
@@ -199,6 +222,12 @@ class SBOMGenerator(object):
                 component = self._create_source_file_component(source_file)
                 if component:
                     bom["components"].append(component)
+                    filename = source_file.get("filename")
+                    source_component_entries.append({
+                        "filename": filename,
+                        "bom_ref": component.get("bom-ref"),
+                        "type": "patch" if self._is_patch_file(filename) else "source"
+                    })
 
             # Convert build toolchain packages to components
             distro = self.detect_chroot_distribution() or "fedora"
@@ -214,6 +243,7 @@ class SBOMGenerator(object):
             # Process binary RPMs and convert to components
             built_package_bom_refs = []
             component_map = {}  # Map package names to bom-refs for dependency resolution
+            primary_rpm_metadata = None  # Store metadata from primary package for metadata enhancement
             
             # Build component map from toolchain packages
             for toolchain_pkg in build_toolchain_packages:
@@ -225,7 +255,7 @@ class SBOMGenerator(object):
             
             for rpm_file in rpm_files:
                 rpm_path = os.path.join(build_dir, rpm_file)
-                component = self._create_built_package_component(rpm_path, distro)
+                component = self._create_built_package_component(rpm_path, distro, source_component_entries)
                 if component:
                     bom_ref = component.get("bom-ref")
                     package_name = component.get("name")
@@ -236,6 +266,28 @@ class SBOMGenerator(object):
                         if package_name:
                             component_map[package_name.lower()] = bom_ref
                     bom["components"].append(component)
+                    
+                    # Store metadata from primary package (prefer main package matching build subject)
+                    if not primary_rpm_metadata:
+                        # Prefer the main package over debuginfo packages
+                        if not package_name or 'debuginfo' not in package_name.lower():
+                            primary_rpm_metadata = self.get_rpm_metadata(rpm_path)
+                    else:
+                        # If we have metadata, check if we should replace it with a better match
+                        current_name = primary_rpm_metadata.get('name', '').lower()
+                        is_current_debuginfo = 'debuginfo' in current_name
+                        is_current_main = build_subject_name and current_name == build_subject_name.lower()
+                        
+                        # Replace if: current is debuginfo and new is not, OR new matches build subject name
+                        should_replace = False
+                        if is_current_debuginfo and package_name and 'debuginfo' not in package_name.lower():
+                            should_replace = True
+                        elif build_subject_name and package_name and package_name.lower() == build_subject_name.lower():
+                            # New package matches build subject name - always prefer it
+                            should_replace = True
+                        
+                        if should_replace:
+                            primary_rpm_metadata = self.get_rpm_metadata(rpm_path)
                     
                     # Create file components for files within this package
                     if package_name and package_version and self.include_file_components:
@@ -250,26 +302,20 @@ class SBOMGenerator(object):
                                 }
                                 bom["dependencies"].append(file_dep)
                     
-                    # Create dependency entry for runtime dependencies
+                    # Create dependency entry for runtime dependencies (libraries/RPMs)
                     dependencies = self.get_rpm_dependencies(rpm_path)
                     runtime_dependency = self._create_dependency(bom_ref, dependencies, component_map, distro)
                     
-                    # Create dependency: package depends on source files (source-to-package relationship)
+                    # Build dependsOn array with runtime dependencies and optionally toolchain
                     all_depends_on = []
                     
-                    # Add source file dependencies if configured
-                    if self.include_source_dependencies:
-                        source_deps = self._get_source_file_bom_refs(package_name, source_files)
-                        if source_deps:
-                            all_depends_on.extend(source_deps)
-                    
-                    # Add runtime dependencies
+                    # Add runtime dependencies (libraries/RPMs this package depends on)
                     if runtime_dependency and runtime_dependency.get("dependsOn"):
                         for dep_ref in runtime_dependency.get("dependsOn", []):
                             if dep_ref not in all_depends_on:
                                 all_depends_on.append(dep_ref)
                     
-                    # Add toolchain dependencies if configured
+                    # Add toolchain dependencies if configured (build-time dependencies)
                     if self.include_toolchain_dependencies and toolchain_bom_refs:
                         for toolchain_ref in toolchain_bom_refs:
                             if toolchain_ref not in all_depends_on:
@@ -278,7 +324,7 @@ class SBOMGenerator(object):
                     # Deduplicate final dependsOn array
                     all_depends_on = list(set(all_depends_on))
                     
-                    # Create combined dependency entry if we have any dependencies
+                    # Create dependency entry if we have any dependencies
                     if all_depends_on:
                         combined_dep = {
                             "ref": bom_ref,
@@ -288,7 +334,70 @@ class SBOMGenerator(object):
                     elif runtime_dependency:
                         # Fall back to just runtime dependencies if no other deps
                         bom["dependencies"].append(runtime_dependency)
+                    
+                    # Note: Source code relationships are represented in component properties
+                    # (mock:source:files, mock:source:refs, mock:patch:files, mock:patch:refs)
+                    # rather than in dependencies, as source code is a build input, not a runtime dependency
 
+            # Add RPM-specific metadata to metadata.properties
+            if primary_rpm_metadata:
+                rpm_props = bom["metadata"]["properties"]
+                
+                # Add buildhost if available
+                buildhost = primary_rpm_metadata.get("buildhost")
+                if buildhost and buildhost != "(none)":
+                    rpm_props.append({
+                        "name": "mock:rpm:buildhost",
+                        "value": buildhost
+                    })
+                
+                # Add buildtime if available
+                buildtime = primary_rpm_metadata.get("buildtime")
+                if buildtime and buildtime != "(none)":
+                    rpm_props.append({
+                        "name": "mock:rpm:buildtime",
+                        "value": buildtime
+                    })
+                
+                # Add source RPM if available
+                sourcerpm = primary_rpm_metadata.get("sourcerpm")
+                if sourcerpm and sourcerpm != "(none)":
+                    rpm_props.append({
+                        "name": "mock:rpm:sourcerpm",
+                        "value": sourcerpm
+                    })
+                
+                # Add group if available
+                group = primary_rpm_metadata.get("group")
+                if group and group != "(none)":
+                    rpm_props.append({
+                        "name": "mock:rpm:group",
+                        "value": group
+                    })
+                
+                # Add epoch if available and not empty
+                epoch = primary_rpm_metadata.get("epoch")
+                if epoch and epoch != "(none)" and epoch.strip():
+                    rpm_props.append({
+                        "name": "mock:rpm:epoch",
+                        "value": epoch
+                    })
+                
+                # Add distribution if available
+                distribution = primary_rpm_metadata.get("distribution")
+                if distribution and distribution != "(none)":
+                    rpm_props.append({
+                        "name": "mock:rpm:distribution",
+                        "value": distribution
+                    })
+                
+                # Add manufacture field if vendor is available
+                vendor = primary_rpm_metadata.get("vendor")
+                if vendor and vendor != "(none)":
+                    bom["metadata"]["manufacture"] = {
+                        "name": vendor
+                    }
+            
             # Add metadata.component representing what this SBOM is about
             # Use the primary built package(s) or create an aggregate component
             if built_package_bom_refs:
@@ -299,28 +408,128 @@ class SBOMGenerator(object):
                     primary_ref = built_package_bom_refs[0]
                     primary_component = next((c for c in bom["components"] if c.get("bom-ref") == primary_ref), None)
                     if primary_component:
-                        bom["metadata"]["component"] = {
+                        component_obj = {
                             "type": primary_component.get("type", "application"),
                             "name": primary_component.get("name"),
                             "version": primary_component.get("version"),
                             "bom-ref": primary_ref,
                             "purl": primary_component.get("purl")
                         }
+                        
+                        # Add description if available
+                        if primary_component.get("description"):
+                            component_obj["description"] = primary_component.get("description")
+                        elif primary_rpm_metadata:
+                            summary = primary_rpm_metadata.get("summary")
+                            if summary and summary != "(none)":
+                                component_obj["description"] = summary
+                        
+                        # Add externalReferences
+                        external_refs = []
+                        if primary_rpm_metadata:
+                            # Add source RPM reference
+                            sourcerpm = primary_rpm_metadata.get("sourcerpm")
+                            if sourcerpm and sourcerpm != "(none)":
+                                external_refs.append({
+                                    "type": "distribution",
+                                    "url": sourcerpm
+                                })
+                            # Add project URL
+                            url = primary_rpm_metadata.get("url")
+                            if url and url != "(none)":
+                                external_refs.append({
+                                    "type": "website",
+                                    "url": url
+                                })
+                        if external_refs:
+                            component_obj["externalReferences"] = external_refs
+                        
+                        # Add license information
+                        if primary_component.get("licenses"):
+                            component_obj["licenses"] = primary_component.get("licenses")
+                        elif primary_rpm_metadata:
+                            license_str = primary_rpm_metadata.get("license")
+                            if license_str and license_str != "(none)":
+                                component_obj["licenses"] = [
+                                    {
+                                        "license": {
+                                            "id": license_str
+                                        }
+                                    }
+                                ]
+                        
+                        bom["metadata"]["component"] = component_obj
                 else:
-                    # Multi-package build: create aggregate component
-                    # Use the first package name as base, or derive from spec file
+                    # Multi-package build: create aggregate component that represents the full build output
                     first_pkg = next((c for c in bom["components"] if c.get("bom-ref") == built_package_bom_refs[0]), None)
                     if first_pkg:
-                        pkg_name = first_pkg.get("name", "unknown")
-                        # Try to extract base name (e.g., "openssl" from "openssl-libs")
-                        base_name = pkg_name.split('-')[0] if '-' in pkg_name else pkg_name
-                        bom["metadata"]["component"] = {
+                        aggregate_name = build_subject_name or first_pkg.get("name", "unknown")
+                        aggregate_version = None
+                        if build_subject_version and build_subject_release:
+                            aggregate_version = f"{build_subject_version}-{build_subject_release}"
+                        elif primary_rpm_metadata:
+                            meta_version = primary_rpm_metadata.get("version")
+                            meta_release = primary_rpm_metadata.get("release")
+                            if meta_version and meta_release:
+                                aggregate_version = f"{meta_version}-{meta_release}"
+                        if not aggregate_version:
+                            aggregate_version = first_pkg.get("version", "unknown")
+
+                        # Build description - prefer summary from RPM, fall back to generic description
+                        description = f"Build output containing {len(built_package_bom_refs)} package(s)"
+                        if primary_rpm_metadata:
+                            summary = primary_rpm_metadata.get("summary")
+                            if summary and summary != "(none)":
+                                description = f"{summary} (build output containing {len(built_package_bom_refs)} package(s))"
+                        
+                        component_obj = {
                             "type": "application",
-                            "name": f"{base_name}-build-output",
-                            "version": first_pkg.get("version", "unknown"),
-                            "bom-ref": f"build-output:{base_name}",
-                            "description": f"Build output containing {len(built_package_bom_refs)} package(s)"
+                            "name": aggregate_name,
+                            "version": aggregate_version,
+                            "bom-ref": f"build-output:{aggregate_name}",
+                            "description": description
                         }
+                        
+                        if aggregate_name and aggregate_version:
+                            component_obj["purl"] = self._generate_purl(aggregate_name, aggregate_version, distro)
+                        elif first_pkg.get("purl"):
+                            component_obj["purl"] = first_pkg.get("purl")
+                        
+                        # Add externalReferences
+                        external_refs = []
+                        if primary_rpm_metadata:
+                            # Add source RPM reference
+                            sourcerpm = primary_rpm_metadata.get("sourcerpm")
+                            if sourcerpm and sourcerpm != "(none)":
+                                external_refs.append({
+                                    "type": "distribution",
+                                    "url": sourcerpm
+                                })
+                            # Add project URL
+                            url = primary_rpm_metadata.get("url")
+                            if url and url != "(none)":
+                                external_refs.append({
+                                    "type": "website",
+                                    "url": url
+                                })
+                        if external_refs:
+                            component_obj["externalReferences"] = external_refs
+                        
+                        # Add license information
+                        if first_pkg.get("licenses"):
+                            component_obj["licenses"] = first_pkg.get("licenses")
+                        elif primary_rpm_metadata:
+                            license_str = primary_rpm_metadata.get("license")
+                            if license_str and license_str != "(none)":
+                                component_obj["licenses"] = [
+                                    {
+                                        "license": {
+                                            "id": license_str
+                                        }
+                                    }
+                                ]
+                        
+                        bom["metadata"]["component"] = component_obj
 
             # Write CycloneDX BOM
             with open(out_file, "w") as f:
@@ -335,7 +544,7 @@ class SBOMGenerator(object):
             self.sbom_done = True
             self.state.finish(state_text)
 
-    def _create_built_package_component(self, rpm_path, distro):
+    def _create_built_package_component(self, rpm_path, distro, source_components=None):
         """Creates a CycloneDX component for a built RPM package."""
         package_data = self.get_rpm_metadata(rpm_path)
         if not package_data:
@@ -412,6 +621,48 @@ class SBOMGenerator(object):
                 "name": "mock:rpm:packager",
                 "value": packager
             })
+
+        buildhost = package_data.get("buildhost")
+        if buildhost and buildhost != "(none)":
+            properties.append({
+                "name": "mock:rpm:buildhost",
+                "value": buildhost
+            })
+
+        buildtime_iso = self._format_epoch_timestamp(package_data.get("buildtime"))
+        if buildtime_iso:
+            properties.append({
+                "name": "mock:rpm:buildtime",
+                "value": buildtime_iso
+            })
+
+        sourcerpm = package_data.get("sourcerpm")
+        if sourcerpm and sourcerpm != "(none)":
+            properties.append({
+                "name": "mock:rpm:sourcerpm",
+                "value": sourcerpm
+            })
+
+        group = package_data.get("group")
+        if group and group != "(none)":
+            properties.append({
+                "name": "mock:rpm:group",
+                "value": group
+            })
+
+        epoch_val = package_data.get("epoch")
+        if epoch_val and epoch_val != "(none)":
+            properties.append({
+                "name": "mock:rpm:epoch",
+                "value": epoch_val
+            })
+
+        distribution = package_data.get("distribution")
+        if distribution and distribution != "(none)":
+            properties.append({
+                "name": "mock:rpm:distribution",
+                "value": distribution
+            })
         
         url = package_data.get("url")
         if url and url != "(none)":
@@ -432,8 +683,21 @@ class SBOMGenerator(object):
             sig_props = self._parse_signature_to_properties(signature)
             properties.extend(sig_props)
         
+        # Note: Source/patch file relationships are represented in component properties
+        # (mock:source:files, mock:source:refs, mock:patch:files, mock:patch:refs)
+        # but are removed from individual package components to reduce noise.
+        # Source code relationships are still available in the components array.
+
         if properties:
             component["properties"] = properties
+        
+        # Add external reference for source RPM if available
+        if sourcerpm and sourcerpm != "(none)":
+            component["externalReferences"] = component.get("externalReferences", [])
+            component["externalReferences"].append({
+                "type": "distribution",
+                "url": sourcerpm
+            })
         
         return component
 
@@ -537,10 +801,7 @@ class SBOMGenerator(object):
         # Add properties
         properties = []
         
-        # Determine if source or patch
-        source_type = "source"
-        if filename.lower().startswith("patch") or filename.endswith(".patch"):
-            source_type = "patch"
+        source_type = "patch" if self._is_patch_file(filename) else "source"
         
         properties.append({
             "name": "mock:source:type",
@@ -559,6 +820,69 @@ class SBOMGenerator(object):
             component["properties"] = properties
         
         return component
+
+    def _is_patch_file(self, filename):
+        """Returns True if the filename looks like a patch file."""
+        if not filename:
+            return False
+        lower_name = filename.lower()
+        return lower_name.startswith("patch") or lower_name.endswith(".patch") or lower_name.endswith(".diff")
+
+    def _format_epoch_timestamp(self, epoch_value):
+        """Convert epoch timestamp string to ISO8601 if possible."""
+        if not epoch_value or epoch_value in ("(none)", "None"):
+            return None
+        try:
+            epoch_int = int(epoch_value)
+            if epoch_int <= 0:
+                return None
+            from datetime import datetime, timezone
+            return datetime.fromtimestamp(epoch_int, tz=timezone.utc).isoformat()
+        except Exception:
+            return epoch_value
+
+    def _append_source_properties(self, properties, source_entries):
+        """Append source and patch references to component properties."""
+        if not source_entries:
+            return
+        source_names = set()
+        patch_names = set()
+        source_refs = set()
+        patch_refs = set()
+        for entry in source_entries:
+            filename = entry.get("filename")
+            bom_ref = entry.get("bom_ref")
+            entry_type = entry.get("type", "source")
+            if entry_type == "patch":
+                if filename:
+                    patch_names.add(filename)
+                if bom_ref:
+                    patch_refs.add(bom_ref)
+            else:
+                if filename:
+                    source_names.add(filename)
+                if bom_ref:
+                    source_refs.add(bom_ref)
+        if source_names:
+            properties.append({
+                "name": "mock:source:files",
+                "value": ",".join(sorted(source_names))
+            })
+        if source_refs:
+            properties.append({
+                "name": "mock:source:refs",
+                "value": ",".join(sorted(source_refs))
+            })
+        if patch_names:
+            properties.append({
+                "name": "mock:patch:files",
+                "value": ",".join(sorted(patch_names))
+            })
+        if patch_refs:
+            properties.append({
+                "name": "mock:patch:refs",
+                "value": ",".join(sorted(patch_refs))
+            })
 
     def _generate_file_bom_ref(self, package_name, package_version, file_path):
         """Generates a bom-ref for a file component within a package.
@@ -846,11 +1170,14 @@ class SBOMGenerator(object):
         
         sources = []
         try:
-            # Use rpmspec --parse to get expanded source and patch file names
-            cmd = ["rpmspec", "--parse", spec_path]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
+            chroot_spec_path = self._convert_to_chroot_path(spec_path)
+            # Use rpmspec --parse inside the build chroot to ensure macro expansion matches the build
+            cmd = ["rpmspec", "--parse", chroot_spec_path]
+            result, _ = self.buildroot.doChroot(
+                cmd, shell=False, returnOutput=True, printOutput=False
+            )
             
-            for line in result.stdout.splitlines():
+            for line in (result or "").splitlines():
                 line = line.strip()
                 # Match lines like Source0: or Patch1:
                 match = re.match(r'^(Source|Patch)[0-9]*:\s*(.+)$', line)
@@ -1234,17 +1561,27 @@ class SBOMGenerator(object):
                 "version": "%{VERSION}",
                 "release": "%{RELEASE}",
                 "arch": "%{ARCH}",
+                "epoch": "%{EPOCH}",
                 "summary": "%{SUMMARY}",
                 "license": "%{LICENSE}",
                 "vendor": "%{VENDOR}",
                 "url": "%{URL}",
-                "packager": "%{PACKAGER}"
+                "packager": "%{PACKAGER}",
+                "buildtime": "%{BUILDTIME}",
+                "buildhost": "%{BUILDHOST}",
+                "sourcerpm": "%{SOURCERPM}",
+                "group": "%{GROUP}",
+                "distribution": "%{DISTRIBUTION}"
             }
             
             for field_name, field_format in fields.items():
                 cmd = ["rpm", "-qp", rpm_path, "--queryformat", field_format]
                 result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
-                metadata[field_name] = result.stdout.strip()
+                value = result.stdout.strip()
+                # Handle empty epoch (rpm returns empty string for no epoch)
+                if field_name == "epoch" and not value:
+                    value = "(none)"
+                metadata[field_name] = value
             
             print(f"RPM metadata extracted: {metadata}")
             return metadata
@@ -1345,50 +1682,30 @@ class SBOMGenerator(object):
         print(f"Extracting source files from source RPM: {src_rpm_path}")
         source_files = []
         try:
-            # List contents of source RPM
-            cmd = ["rpm", "-qpl", src_rpm_path]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
-            
-            for line in result.stdout.splitlines():
-                if line.startswith('/'):
-                    # This is a file in the source RPM
-                    filename = os.path.basename(line)
-                    
-                    # Try to extract the file and calculate its hash
-                    temp_dir = "/tmp/srpm_extract"
-                    os.makedirs(temp_dir, exist_ok=True)
-                    
-                    try:
-                        # Extract just this file from the RPM
-                        extract_cmd = f"rpm2cpio {src_rpm_path} | cpio -id {filename} 2>/dev/null"
-                        subprocess.run(extract_cmd, shell=True, cwd=temp_dir, check=True)
-                        
-                        file_path = os.path.join(temp_dir, filename)
-                        if os.path.isfile(file_path):
-                            sha256 = self.hash_file(file_path)
-                            signature = self.get_file_signature(file_path)
-                            
-                            source_files.append({
-                                "filename": filename,
-                                "sha256": sha256,
-                                "digital_signature": signature
-                            })
-                            
-                            # Clean up
-                            os.remove(file_path)
-                    except Exception as e:
-                        print(f"Failed to extract {filename} from source RPM: {e}")
-                        # Add without hash if extraction fails
-                        source_files.append({
-                            "filename": filename,
-                            "sha256": None,
-                            "digital_signature": None
-                        })
-            
-            # Clean up temp directory
+            temp_dir = tempfile.mkdtemp(prefix="sbom-srpm-")
             try:
-                os.rmdir(temp_dir)
-            except:
+                extract_cmd = f"rpm2cpio {shlex.quote(src_rpm_path)} | cpio -idm 2>/dev/null"
+                subprocess.run(extract_cmd, shell=True, cwd=temp_dir, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to unpack source RPM {src_rpm_path}: {e}")
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return source_files
+            
+            for root_dir, _, files in os.walk(temp_dir):
+                for file_name in files:
+                    if file_name.endswith(".spec"):
+                        continue
+                    file_path = os.path.join(root_dir, file_name)
+                    sha256 = self.hash_file(file_path)
+                    signature = self.get_file_signature(file_path)
+                    source_files.append({
+                        "filename": file_name,
+                        "sha256": sha256,
+                        "digital_signature": signature
+                    })
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
                 pass
                 
             print(f"Extracted source files from source RPM: {source_files}")
@@ -1396,3 +1713,15 @@ class SBOMGenerator(object):
             print(f"Failed to extract source files from source RPM {src_rpm_path}: {e}")
         
         return source_files
+
+    def _convert_to_chroot_path(self, host_path):
+        """Convert an absolute host path into the corresponding path inside the build chroot."""
+        rootdir = getattr(self.buildroot, "rootdir", "")
+        if not rootdir:
+            return host_path
+        if host_path.startswith(rootdir):
+            rel_path = host_path[len(rootdir):]
+            if not rel_path.startswith("/"):
+                rel_path = "/" + rel_path
+            return rel_path
+        return host_path
