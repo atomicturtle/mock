@@ -369,7 +369,7 @@ class SBOMGenerator:
 
         if hasattr(self, 'prebuild_spec_metadata') and self.prebuild_spec_metadata:
             spec_metadata = self.prebuild_spec_metadata
-            source_files = self.prebuild_source_files
+            source_files = list(self.prebuild_source_files or [])
             build_subject_name = spec_metadata.get("name")
             build_subject_version = spec_metadata.get("version")
             build_subject_release = spec_metadata.get("release")
@@ -380,7 +380,7 @@ class SBOMGenerator:
                 build_subject_version = spec_metadata.get("version")
                 build_subject_release = spec_metadata.get("release")
             if parsed_sources:
-                source_files = parsed_sources
+                source_files = list(parsed_sources)
 
         if src_rpm_files:
             srpm_path = os.path.join(build_dir, src_rpm_files[0])
@@ -393,21 +393,25 @@ class SBOMGenerator:
                 if not build_subject_release:
                     build_subject_release = srpm_metadata.get("release")
 
-            if not source_files:
-                # Extract metadata for source files from source RPM without full extraction
-                source_files = self.rpm_helper.extract_source_files_from_srpm(srpm_path)
+            srpm_sources = self.rpm_helper.extract_source_files_from_srpm(srpm_path)
+            source_files = self.rpm_helper.merge_source_files(source_files, srpm_sources)
 
             # Record the source RPM itself as an input artifact
             srpm_name = src_rpm_files[0]
             srpm_sig = self.rpm_helper.get_rpm_signature(srpm_path)
             srpm_hash = self.rpm_helper.hash_file(srpm_path)
-            # Add to the beginning of the list for visibility
-            source_files.insert(0, {
+            srpm_entry = {
                 "filename": srpm_name,
                 "sha256": srpm_hash,
                 "digital_signature": srpm_sig,
                 "source_type": "source_rpm"
-            })
+            }
+            existing = next((entry for entry in source_files if entry.get("filename") == srpm_name), None)
+            if existing:
+                existing["sha256"] = existing.get("sha256") or srpm_hash
+                existing["digital_signature"] = existing.get("digital_signature") or srpm_sig
+            else:
+                source_files.insert(0, srpm_entry)
 
         return (
             spec_metadata, build_subject_name, build_subject_version,
@@ -491,8 +495,9 @@ class SBOMGenerator:
                 )
                 out_file = os.path.join(self.buildroot.resultdir, sbom_filename)
 
-                # Create CycloneDX document
+                # Create CycloneDX document with full build metadata (tools, hardening, etc.)
                 bom = self.cdx_gen.create_cyclonedx_document()
+                bom["metadata"] = self._create_metadata()
 
                 # Add source and toolchain components
                 source_components, source_component_entries = self.cdx_gen.add_source_components(bom, source_files)

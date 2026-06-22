@@ -258,13 +258,13 @@ class CycloneDxGenerator:
             "bom-ref": bom_ref,
             "name": filename,
             "properties": [
-                {"name": "mock:source:type", "value": "patch" if self.is_patch_file(filename) else "archive"}
+                {"name": "mock:source:type", "value": "patch" if self.is_patch_file(filename) else "source"}
             ]
         }
         if sha256:
             comp["hashes"] = [{"alg": "SHA-256", "content": sha256}]
         if sig:
-            comp["properties"].append({"name": "mock:signature:status", "value": sig})
+            comp["properties"].append({"name": "mock:signature:info", "value": sig})
 
         return comp
 

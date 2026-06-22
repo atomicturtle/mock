@@ -433,46 +433,122 @@ class RpmQueryHelper:
             self.buildroot.root_log.debug(f"Failed to hash file {file_path}: {e}")
             return None
 
+    @staticmethod
+    def merge_source_files(spec_sources, srpm_sources):
+        """Merge SRPM header digests and signatures into spec-derived source entries."""
+        if not srpm_sources:
+            return list(spec_sources or [])
+        if not spec_sources:
+            return list(srpm_sources)
+
+        srpm_by_name = {entry["filename"]: entry for entry in srpm_sources if entry.get("filename")}
+        merged = []
+        seen = set()
+        for entry in spec_sources:
+            filename = entry.get("filename")
+            if not filename:
+                continue
+            srpm_entry = srpm_by_name.get(filename, {})
+            merged.append({
+                "filename": filename,
+                "sha256": entry.get("sha256") or srpm_entry.get("sha256"),
+                "digital_signature": entry.get("digital_signature") or srpm_entry.get("digital_signature"),
+            })
+            seen.add(filename)
+
+        for srpm_entry in srpm_sources:
+            filename = srpm_entry.get("filename")
+            if filename and filename not in seen:
+                merged.append(dict(srpm_entry))
+        return merged
+
+    @staticmethod
+    def _source_file_signature(filename, file_set):
+        """Return GPG companion-file status for a source archive or patch."""
+        if filename.endswith(".asc") or filename.endswith(".sig"):
+            return "File is a signature file"
+        for ext in (".asc", ".sig"):
+            if filename + ext in file_set:
+                return f"GPG signature file exists: {filename}{ext}"
+        return None
+
+    def _extract_source_files_from_srpm_header(self, src_rpm_path):
+        """Read per-file digests from an SRPM header via python-rpm."""
+        # pylint: disable=no-member
+        source_files = []
+        ts = rpm.TransactionSet()
+        with open(src_rpm_path, "rb") as f:
+            hdr = ts.hdrFromFdno(f.fileno())
+
+        basenames = hdr[rpm.RPMTAG_BASENAMES]
+        digests = hdr[rpm.RPMTAG_FILEDIGESTS]
+        file_set = set(basenames)
+
+        for filename, sha256 in zip(basenames, digests):
+            if isinstance(filename, bytes):
+                filename = filename.decode("utf-8", "replace")
+            if filename.endswith(".spec"):
+                continue
+            source_files.append({
+                "filename": filename,
+                "sha256": sha256.decode("utf-8", "replace") if isinstance(sha256, bytes) else sha256,
+                "digital_signature": self._source_file_signature(filename, file_set),
+            })
+        return source_files
+
+    def _extract_source_files_from_srpm_cli(self, src_rpm_path):
+        """Read per-file digests from an SRPM using the host rpm binary."""
+        source_files = []
+        query_format = "[%{BASENAMES}|%{FILEDIGESTS}\n]"
+        try:
+            output = subprocess.check_output(
+                ["rpm", "-qp", "--qf", query_format, src_rpm_path],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except (subprocess.CalledProcessError, OSError) as e:
+            self.buildroot.root_log.debug(f"rpm query failed for {src_rpm_path}: {e}")
+            return source_files
+
+        file_set = set()
+        entries = []
+        for line in output.splitlines():
+            if "|" not in line:
+                continue
+            filename, sha256 = line.split("|", 1)
+            if filename.endswith(".spec"):
+                continue
+            file_set.add(filename)
+            entries.append((filename, sha256))
+
+        for filename, sha256 in entries:
+            source_files.append({
+                "filename": filename,
+                "sha256": sha256,
+                "digital_signature": self._source_file_signature(filename, file_set),
+            })
+        return source_files
+
     def extract_source_files_from_srpm(self, src_rpm_path):
         """Extracts metadata for source files from a source RPM without full extraction."""
-        # pylint: disable=no-member
         self.buildroot.root_log.debug(f"Extracting source metadata from source RPM: {src_rpm_path}")
-        source_files = []
         if not os.path.isfile(src_rpm_path):
-            return source_files
-        try:
-            ts = rpm.TransactionSet()
-            with open(src_rpm_path, "rb") as f:
-                hdr = ts.hdrFromFdno(f.fileno())
+            return []
 
-            basenames = hdr[rpm.RPMTAG_BASENAMES]
-            digests = hdr[rpm.RPMTAG_FILEDIGESTS]
+        for extractor in (
+            self._extract_source_files_from_srpm_header,
+            self._extract_source_files_from_srpm_cli,
+        ):
+            try:
+                source_files = extractor(src_rpm_path)
+                if source_files:
+                    return source_files
+            except Exception as e:
+                self.buildroot.root_log.debug(
+                    f"Source metadata extraction via {extractor.__name__} failed for {src_rpm_path}: {e}"
+                )
 
-            # Create a set for quick lookup of signature files
-            file_set = set(basenames)
-
-            for filename, sha256 in zip(basenames, digests):
-                if filename.endswith(".spec"):
-                    continue
-
-                signature = None
-                if filename.endswith(".asc") or filename.endswith(".sig"):
-                    signature = "File is a signature file"
-                else:
-                    for ext in [".asc", ".sig"]:
-                        if filename + ext in file_set:
-                            signature = f"GPG signature file exists: {filename}{ext}"
-                            break
-
-                source_files.append({
-                    "filename": filename,
-                    "sha256": sha256,
-                    "digital_signature": signature
-                })
-        except Exception as e:
-            self.buildroot.root_log.debug(f"Failed to extract source metadata from {src_rpm_path}: {e}")
-
-        return source_files
+        return []
 
 
 
