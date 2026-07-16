@@ -25,6 +25,7 @@ from .file_downloader import FileDownloader
 from .exception import PkgError, Error, RootError, BuildError
 from .trace_decorator import getLog, traceLog
 from .rebuild import do_rebuild
+from .rpmbuild import RpmBuild
 
 
 class Commands(object):
@@ -60,7 +61,6 @@ class Commands(object):
         self.no_root_shells = config['no_root_shells']
 
         self.private_network = not config['rpmbuild_networking']
-        self.rpmbuild_noclean_option = None
 
         # on-demand buildroot properties
         # spec path in buildroot
@@ -249,7 +249,7 @@ class Commands(object):
     #       -> except hooks. :)
     #
     @traceLog()
-    def build(self, srpm, timeout, check=True, spec=None):
+    def build(self, srpm, spec=None):
         """build an srpm into binary rpms, capture log"""
 
         # tell caching we are building
@@ -282,7 +282,7 @@ class Commands(object):
             max_loops = int(self.config.get('static_buildrequires_max_loops'))
             for _ in range(max_loops):
                 packages_before = self.buildroot.all_chroot_packages()
-                rebuilt_srpm = self.rebuild_installed_srpm(spec_path, timeout)
+                rebuilt_srpm = self.rebuild_installed_srpm(spec_path)
 
                 # Check if we will have dynamic BuildRequires, but do not allow it
                 hdr = next(util.yieldSrpmHeaders((rebuilt_srpm,)))
@@ -312,7 +312,7 @@ class Commands(object):
 
             try:
                 self.state.start(rpmbuildstate)
-                results = self.rebuild_package(spec_path, timeout, check, dynamic_buildreqs)
+                results = self.rebuild_package(spec_path, dynamic_buildreqs)
             finally:
                 self.state.finish(rpmbuildstate)
 
@@ -371,6 +371,7 @@ class Commands(object):
                                cwd=cwd,
                                nspawn_args=self.config.get("nspawn_args", []),
                                unshare_net=self.private_network,
+                               pivot_root_chroot=self.config.get("pivot_root_chroot", False),
                                cmd=cmd)
         finally:
             log.debug("shell: unmounting all filesystems")
@@ -558,7 +559,7 @@ class Commands(object):
     #       -> except hooks. :)
     #
     @traceLog()
-    def buildsrpm(self, spec, sources, timeout, follow_links):
+    def buildsrpm(self, spec, sources, follow_links):
         """build an srpm, capture log"""
 
         # tell caching we are building
@@ -600,7 +601,7 @@ class Commands(object):
 
             self.state.start("rpmbuild -bs")
             try:
-                rebuilt_srpm = self.rebuild_installed_srpm(chrootspec, timeout)
+                rebuilt_srpm = self.rebuild_installed_srpm(chrootspec)
             finally:
                 self.state.finish("rpmbuild -bs")
 
@@ -665,45 +666,10 @@ class Commands(object):
             raise PkgError("Source RPM is not installable:\n{0}".format(output))
 
 
-    @property
-    def _rpmbuild_noclean_option(self):
-        """
-        Detect and cache if rpmbuild in buildroot supports the --noclean
-        option.  Return "--noclean" string if supported, otherwise return an
-        empty string.
-
-        TODO: Remove this method once nobody is building for RHEL 6.
-        """
-        if self.config["cleanup_on_success"]:
-            return ""
-
-        if self.rpmbuild_noclean_option is not None:
-            return self.rpmbuild_noclean_option
-
-        self.rpmbuild_noclean_option = ""
-        _, status = self.buildroot.doChroot(
-                "case $(rpmbuild --help) in *--noclean*) exit 0; esac; exit 1",
-                shell=True, raiseExc=False
-        )
-        if not status:
-            self.rpmbuild_noclean_option = "--noclean"
-        return self.rpmbuild_noclean_option
-
-
     @traceLog()
-    def rebuild_installed_srpm(self, spec_path, timeout):
-        command = ['{command} -bs {0} --target {1} --nodeps {2}'.format(
-            self._rpmbuild_noclean_option, self.rpmbuild_arch, spec_path,
-            command=self.config['rpmbuild_command'])]
-        command = ["bash", "--login", "-c"] + command
-        self.buildroot.doChroot(
-            command,
-            shell=False, logger=self.buildroot.build_log, timeout=timeout,
-            uid=self.buildroot.chrootuid, gid=self.buildroot.chrootgid,
-            user=self.buildroot.chrootuser,
-            unshare_net=self.private_network,
-            printOutput=self.config['print_main_output']
-        )
+    def rebuild_installed_srpm(self, spec_path):
+        rpmbuild = RpmBuild(self.buildroot, self.config, spec_path)
+        rpmbuild.run(['-bs'])
         results = glob.glob("%s/%s/SRPMS/*src.rpm" % (self.make_chroot_path(),
                                                       self.buildroot.builddir))
         if len(results) != 1:
@@ -713,15 +679,8 @@ class Commands(object):
         return results[0]
 
     @traceLog()
-    def rebuild_package(self, spec_path, timeout, check, dynamic_buildrequires):
-        # --nodeps because rpm in the root may not be able to read rpmdb
-        # created by rpm that created it (outside of chroot)
-        check_opt = []
-        calculatedeps = self.config["calculatedeps"]
-        if not check:
-            # this is because EL5/6 does not know --nocheck
-            # when EL5/6 targets are not supported, replace it with --nocheck
-            check_opt += ["--define", "'__spec_check_template exit 0; '"]
+    def rebuild_package(self, spec_path, dynamic_buildrequires):
+        rpmbuild = RpmBuild(self.buildroot, self.config, spec_path)
 
         mode = ['-bb']
         sc = self.config.get('short_circuit')
@@ -731,20 +690,10 @@ class Commands(object):
                        'build': '-bc',
                        'binary': '-bb'}[sc]
             mode += ['--short-circuit']
-        additional_opts = [self.config.get('rpmbuild_opts', '')]
-        if additional_opts == ['']:
-            additional_opts = []
-
-        def get_command(mode, checkdeps=False):
-            nodeps_opt = [] if checkdeps else ['--nodeps']
-            command = [self.config['rpmbuild_command']] + mode + \
-                      [self._rpmbuild_noclean_option] + \
-                      ['--target', self.rpmbuild_arch] + nodeps_opt + \
-                      check_opt + [spec_path] + additional_opts
-            command = ["bash", "--login", "-c"] + [' '.join(command)]
-            return command
 
         bd_out = self.make_chroot_path(self.buildroot.builddir)
+        # Are we going to skip the actual build (end after build requires resolution)?
+        calculatedeps = self.config["calculatedeps"]
         dynamic_buildrequires = dynamic_buildrequires and self.config.get('dynamic_buildrequires')
         if dynamic_buildrequires:
             max_loops = int(self.config.get('dynamic_buildrequires_max_loops'))
@@ -756,18 +705,12 @@ class Commands(object):
                 # * installSrpmDeps does nothing
                 # * or we run out of dynamic_buildrequires_max_loops tries
                 packages_before = self.buildroot.all_chroot_packages()
-                command = get_command(br_mode)
-                (output, returncode) = \
-                    self.buildroot.doChroot(command,
-                                            shell=False, logger=self.buildroot.build_log, timeout=timeout,
-                                            uid=self.buildroot.chrootuid, gid=self.buildroot.chrootgid,
-                                            user=self.buildroot.chrootuser,
-                                            unshare_net=self.private_network, raiseExc=False,
-                                            printOutput=self.config['print_main_output'])
+                (output, returncode) = rpmbuild.run_build(
+                    br_mode, raiseExc=False)
                 if returncode > 0 and returncode != 11:
                     # we treat exit status 11 as success, as well as exit
                     # status 0, see issue#434
-                    raise BuildError("Command failed: \n # %s\n%s" % (command, output))
+                    raise BuildError("Command failed: \n # %s\n%s" % (rpmbuild.last_command, output))
                 max_loops -= 1
                 self.buildroot.build_log.info("Dynamic buildrequires detected")
                 self.buildroot.build_log.info("Going to install missing buildrequires. See root.log for details.")
@@ -807,12 +750,9 @@ class Commands(object):
 
         if not calculatedeps:
             checkdeps = dynamic_buildrequires and self.bootstrap_buildroot is not None
-            self.buildroot.doChroot(get_command(mode, checkdeps=checkdeps),
-                                    shell=False, logger=self.buildroot.build_log, timeout=timeout,
-                                    uid=self.buildroot.chrootuid, gid=self.buildroot.chrootgid,
-                                    user=self.buildroot.chrootuser,
-                                    unshare_net=self.private_network,
-                                    printOutput=self.config['print_main_output'])
+            rpmbuild.run_build(mode, checkdeps=checkdeps)
+            rpmbuild.run_separate_check()
+
         results = glob.glob(bd_out + '/RPMS/*.rpm')
         results += glob.glob(bd_out + '/SRPMS/*.rpm')
         self.buildroot.final_rpm_list = [os.path.basename(result) for result in results]

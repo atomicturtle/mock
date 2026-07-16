@@ -294,6 +294,7 @@ class _PackageManager(object):
             env['LD_PRELOAD'] = self.buildroot.nosync_path
         invocation = self.build_invocation(*args)
         self.buildroot.root_log.debug(invocation)
+        kwargs.setdefault("pivot_root_chroot", self.buildroot.config.get("pivot_root_chroot", False))
         kwargs['printOutput'] = kwargs.get('printOutput', True)
         if not self.config['print_main_output']:
             kwargs.pop('printOutput', None)

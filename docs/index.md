@@ -70,6 +70,7 @@ Versions in Linux distributions:
 
 
 ## Release Notes
+* [Configs 44.4](Release-Notes-Configs-44.4) (2026-06-24) - Fedora Rawhide RISC-V, Azure Linux 4.0 beta
 * [Configs 44.3](Release-Notes-Configs-44.3) (2026-06-10) - AlmaLinux bootstrap_image_ready, ELN package rename, AlmaLinux x86_64_v2 bootstrap re-enabled, RISC-V 64-bit for Fedora 44.
 * [6.7 and Configs 44.2](Release-Notes-6.7) (2026-03-02) - New plugin `expand_spec`, yum support for `--calculate-dependencies`, bugfixes.
 * [Configs 44.1](Release-Notes-Configs-44.1) (2026-02-03) - Fedora 44 branched from Rawhide.

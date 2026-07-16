@@ -4,6 +4,7 @@ import glob
 import importlib
 import json
 import os
+import shlex
 import shutil
 import tarfile
 import tempfile
@@ -145,6 +146,11 @@ def step_impl(context):
 def step_impl(context, options):
     options = options.split()
     context.last_cmd = run(['mock'] + options)
+
+
+@when('a command "{cmd}" is run in the mock chroot')
+def step_impl(context, cmd):
+    context.last_cmd = run(context.mock.basecmd + ["--chroot", "--"] + shlex.split(cmd))
 
 
 @given('mock is always executed with "{options}"')

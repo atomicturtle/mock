@@ -423,6 +423,9 @@ class Buildroot(object):
         # implemented).
         assert "chrootPath" not in kwargs
 
+        # Set pivot_root_chroot before delegating to bootstrap
+        kwargs.setdefault("pivot_root_chroot", self.config.get("pivot_root_chroot", False))
+
         if self.bootstrap_buildroot:
             with self.mounts.buildroot_in_bootstrap_mounted():
                 return self.bootstrap_buildroot.doChroot(
@@ -445,6 +448,7 @@ class Buildroot(object):
 
         kargs.setdefault("nspawn_args", [])
         kargs["nspawn_args"].extend(self.config.get("nspawn_args", []))
+        kargs.setdefault("pivot_root_chroot", self.config.get("pivot_root_chroot", False))
 
         try:
             result = util.do_with_status(command, chrootPath=self.make_chroot_path(),
@@ -1090,7 +1094,29 @@ class Buildroot(object):
 
         return util.BindMountedFile(chroot_filename, host_filename)
 
-    @traceLog()
+    @contextmanager
+    def protect_artifact_dirs(self):
+        """Hide RPMS/ and SRPMS/ under a tmpfs overlay so %check cannot modify built artifacts."""
+        chroot_builddir = self.make_chroot_path(self.builddir)
+        getLog().info("Protecting built artifacts in RPMS/ and SRPMS/ with tmpfs overlay")
+        mounted = []
+        try:
+            with self.uid_manager.elevated_privileges():
+                for subdir in ('RPMS', 'SRPMS'):
+                    artifact_dir = os.path.join(chroot_builddir, subdir)
+                    mount = mounts.FileSystemMountPoint(
+                        path=artifact_dir, filetype='tmpfs',
+                        options='size=1m')
+                    mount.mount()
+                    mounted.append(mount)
+            yield
+        finally:
+            with self.uid_manager.elevated_privileges():
+                for mp in mounted:
+                    if not mp.umount():
+                        raise RootError(
+                            f"Failed to unmount artifact protection from {mp.mountpath}")
+
     def backup_build_results(self):
         """
         Back up built RPMs if `backup_on_clean` is enabled, before cleaning the chroot and results.

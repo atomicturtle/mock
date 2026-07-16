@@ -40,13 +40,21 @@ from .trace_decorator import getLog, traceLog
 from .uid import setresuid
 from pyroute2 import IPRoute
 
-_libc = ctypes.cdll.LoadLibrary(None)
+_libc = ctypes.CDLL(None, use_errno=True)
 _libc.personality.argtypes = [ctypes.c_ulong]
 _libc.personality.restype = ctypes.c_int
 _libc.unshare.argtypes = [ctypes.c_int]
 _libc.unshare.restype = ctypes.c_int
+_libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                         ctypes.c_char_p, ctypes.c_ulong,
+                         ctypes.c_void_p]
+_libc.mount.restype = ctypes.c_int
+_libc.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
+_libc.umount2.restype = ctypes.c_int
 _libc.sethostname.argtypes = [ctypes.c_char_p, ctypes.c_int]
 _libc.sethostname.restype = ctypes.c_int
+_libc.pivot_root.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+_libc.pivot_root.restype = ctypes.c_int
 
 # See linux/include/sched.h
 CLONE_NEWNS = 0x00020000
@@ -54,6 +62,14 @@ CLONE_NEWUTS = 0x04000000
 CLONE_NEWPID = 0x20000000
 CLONE_NEWNET = 0x40000000
 CLONE_NEWIPC = 0x08000000
+
+# Mount flags used by condChrootPivotRoot
+# See libmount/libmount.h (libmount-devel)
+MS_BIND    = 0x1000       # 4096: Mount existing tree elsewhere as well
+MS_REC     = 0x4000       # 16384: Recursive loopback
+MS_PRIVATE = 0x40000      # 262144: Make private
+# See sys/mount.h
+MNT_DETACH = 0x00000002   # 2: Just detach from tree
 
 # taken from sys/personality.h
 PER_LINUX32 = 0x0008
@@ -310,6 +326,65 @@ def condChroot(chrootPath):
         setresuid(saved['ruid'], saved['euid'])
 
 
+def _do_pivot_root(chrootPath):
+    """Perform pivot_root(2) chroot.  Caller must already be running as root."""
+    chroot_bytes = chrootPath.encode('utf-8')
+
+    # New mount namespace so our mount changes don't affect the parent
+    if _libc.unshare(CLONE_NEWNS) != 0:
+        raise OSError(ctypes.get_errno(), "unshare(CLONE_NEWNS)")
+
+    # Make all existing mounts private to prevent propagation
+    if _libc.mount(b"none", b"/", None, MS_REC | MS_PRIVATE, None) != 0:
+        raise OSError(ctypes.get_errno(), "mount --make-rprivate /")
+
+    # Bind-mount the chroot dir onto itself so it becomes a mount point
+    # (pivot_root requires new_root to be a mount point)
+    if _libc.mount(chroot_bytes, chroot_bytes, None,
+                    MS_BIND | MS_REC, None) != 0:
+        raise OSError(ctypes.get_errno(), "bind mount " + chrootPath)
+
+    # Directory where the old root will be stashed
+    put_old = os.path.join(chrootPath, ".pivot_old")
+    file_util.mkdirIfAbsent(put_old)
+    put_old_bytes = put_old.encode('utf-8')
+
+    if _libc.pivot_root(chroot_bytes, put_old_bytes) != 0:
+        raise OSError(ctypes.get_errno(), "pivot_root")
+
+    os.chdir("/")
+
+    # Detach the old root — it is no longer needed
+    if _libc.umount2(b"/.pivot_old", MNT_DETACH) != 0:
+        raise OSError(ctypes.get_errno(), "umount2 /.pivot_old")
+
+    os.rmdir("/.pivot_old")
+
+
+def condChrootPivotRoot(chrootPath):
+    """
+    Chroot using pivot_root(2) to allow user namespaces afterward.
+
+    The kernel blocks unshare(CLONE_NEWUSER) after plain chroot() because
+    the process root no longer matches the mount namespace root.  By using
+    pivot_root(2) inside a private mount namespace we atomically swap the
+    mount-namespace root to chrootPath, satisfying the kernel check.
+
+    This is the same approach used by bubblewrap and other container runtimes.
+
+    Requires CAP_SYS_ADMIN (available in --privileged containers).
+    """
+    if chrootPath is None:
+        return
+
+    saved = {"ruid": os.getuid(), "euid": os.geteuid()}
+    setresuid(0, 0, 0)
+    try:
+        _do_pivot_root(chrootPath)
+    finally:
+        setresuid(saved['ruid'], saved['euid'])
+
+
 def condChdir(cwd):
     if cwd is not None:
         os.chdir(cwd)
@@ -526,7 +601,7 @@ def do(*args, **kargs):
 def do_with_status(command, shell=False, chrootPath=None, cwd=None, timeout=0, raiseExc=True,
                    returnOutput=0, uid=None, gid=None, user=None, personality=None,
                    printOutput=False, env=None, pty=False, nspawn_args=None, unshare_net=False,
-                   returnStderr=True, *_, **kargs):
+                   returnStderr=True, pivot_root_chroot=False, *_, **kargs):
     logger = kargs.get("logger", getLog())
     if timeout == 0:
         timeout = _OPS_TIMEOUT
@@ -536,8 +611,12 @@ def do_with_status(command, shell=False, chrootPath=None, cwd=None, timeout=0, r
         lead_pty, sub_pty = os.openpty()
         resize_pty(sub_pty)
         reader = os.fdopen(lead_pty, 'rb')
+    if pivot_root_chroot and chrootPath and USE_NSPAWN:
+        logger.warning(
+            "pivot_root_chroot=True ignored when using systemd-nspawn")
     preexec = ChildPreExec(personality, chrootPath, cwd, uid, gid,
-                           unshare_ipc=bool(chrootPath), unshare_net=unshare_net)
+                           unshare_ipc=bool(chrootPath), unshare_net=unshare_net,
+                           pivot_root_chroot=pivot_root_chroot)
     if env is None:
         env = clean_env()
     stdout = None
@@ -616,11 +695,13 @@ def do_with_status(command, shell=False, chrootPath=None, cwd=None, timeout=0, r
 class ChildPreExec(object):
     def __init__(self, personality, chrootPath, cwd, uid, gid, env=None,
                  shell=False, unshare_ipc=False, unshare_net=False,
-                 no_setsid=False):
+                 no_setsid=False, pivot_root_chroot=False):
         """
         Params:
         - no_setsid - assure we don't call os.setsid(), as the process we run
             calls that itself
+        - pivot_root_chroot - use pivot_root(2) for chroot to enable
+            user namespaces afterward (requires CAP_SYS_ADMIN)
         """
         self.personality = personality
         self.chrootPath = chrootPath
@@ -632,6 +713,7 @@ class ChildPreExec(object):
         self.unshare_ipc = unshare_ipc
         self.unshare_net = unshare_net
         self.no_setsid = no_setsid
+        self.pivot_root_chroot = pivot_root_chroot
         getLog().debug("child environment: %s", env)
 
     def __call__(self, *args, **kargs):
@@ -644,7 +726,10 @@ class ChildPreExec(object):
         # Even if nspawn is allowed to be used, it won't be used unless there
         # is a chrootPath set
         if not USE_NSPAWN or not self.chrootPath:
-            condChroot(self.chrootPath)
+            if self.pivot_root_chroot:
+                condChrootPivotRoot(self.chrootPath)
+            else:
+                condChroot(self.chrootPath)
             condDropPrivs(self.uid, self.gid)
             condChdir(self.cwd)
         condUnshareIPC(self.unshare_ipc)
@@ -795,11 +880,13 @@ def _prepare_nspawn_command(chrootPath, user, cmd, nspawn_args=None, env=None,
 
     return nspawn_argv + cmd
 
+# pylint: disable=too-many-arguments,too-many-positional-arguments
 def doshell(chrootPath=None, environ=None, uid=None, gid=None, cmd=None,
             cwd=None,
             nspawn_args=None,
             unshare_ipc=True,
-            unshare_net=False):
+            unshare_net=False,
+            pivot_root_chroot=False):
     log = getLog()
     log.debug("doshell: chrootPath:%s, uid:%d, gid:%d", chrootPath, uid, gid)
     if environ is None:
@@ -821,10 +908,13 @@ def doshell(chrootPath=None, environ=None, uid=None, gid=None, cmd=None,
     elif isinstance(cmd, list):
         cmd = ' '.join(cmd)
 
+    if pivot_root_chroot and chrootPath and USE_NSPAWN:
+        log.warning(
+            "pivot_root_chroot=True ignored when using systemd-nspawn")
     preexec = ChildPreExec(personality=None, chrootPath=chrootPath, cwd=cwd,
                            uid=uid, gid=gid, env=environ, shell=shell,
                            unshare_ipc=unshare_ipc, unshare_net=unshare_net,
-                           no_setsid=no_setsid)
+                           no_setsid=no_setsid, pivot_root_chroot=pivot_root_chroot)
 
     if USE_NSPAWN:
         # nspawn cannot set gid

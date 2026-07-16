@@ -262,6 +262,15 @@ def command_parse():
                            " (i.e. --install). Only useful when using tmpfs plugin.")
     parser.add_option("--nocheck", action="store_false", dest="check",
                       default=True, help="pass --nocheck to rpmbuild to skip 'make check' tests")
+    parser.add_option("--separate-check",
+                      choices=['best_effort', 'enforce', 'off'],
+                      default=None, dest="separate_check",
+                      help="Run %%check as a separate rpmbuild phase using -bk.  "
+                           "'best_effort' uses it when rpmbuild supports -bk, "
+                           "falls back silently otherwise.  'enforce' fails if "
+                           "rpmbuild does not support -bk (rpm >= 6.0.91).  "
+                           "'off' disables the feature (overrides config).  "
+                           "Default: 'off'.")
     parser.add_option("--arch", action="store", dest="arch",
                       default=None, help="Sets kernel personality().")
     parser.add_option("--forcearch", action="store", dest="forcearch",
@@ -622,7 +631,8 @@ def rootcheck():
     "verify mock was started correctly (either by sudo or consolehelper)"
     # if we're root due to sudo or consolehelper, we're ok
     # if not raise an exception and bail
-    if os.getuid() == 0 and not (os.environ.get("SUDO_UID") or os.environ.get("USERHELPER_UID")):
+    if os.getuid() == 0 and not (os.environ.get("SUDO_UID") or os.environ.get("USERHELPER_UID") or \
+            os.environ.get("PKEXEC_UID")):
         raise RuntimeError("mock will not run from the root account (needs an unprivileged uid so it can drop privs)")
 
 

@@ -3,7 +3,7 @@
 %endif
 
 Name:       mock-core-configs
-Version:    44.3
+Version:    44.4
 Release:    1%{?dist}
 Summary:    Mock core config files basic chroots
 
@@ -156,6 +156,10 @@ fi
 %ghost %config(noreplace,missingok) %{_sysconfdir}/mock/default.cfg
 
 %changelog
+* Wed Jun 24 2026 Pavel Raiskup <pavel@raiskup.cz> 44.4-1
+- Fixes #1761: Add Fedora Rawhide RISC-V (jmontleo@redhat.com)
+- configs: add Azure Linux 4.0 beta configuration (tobiasb@microsoft.com)
+
 * Wed Jun 10 2026 Pavel Raiskup <pavel@raiskup.cz> 44.3-1
 - the fedora-release-eln renamed to fedora-eln-release
 - Add config for Fedora 44 version of RISC-V port (marcin@juszkiewicz.com.pl)

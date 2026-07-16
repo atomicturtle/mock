@@ -35,6 +35,7 @@ class Error(Exception):
 # 4 = only some packages were build during --chain
 # 5 = cmdline processing error
 # 6 = invalid architecture
+# 7 = invalid, unsupported, or incompatible option value
 # 10 = problem building the package
 # 11 = command timeouted
 # 20 = error in the chroot of some kind
@@ -69,6 +70,8 @@ def get_class_by_code(exit_code):
         return BadCmdline("Command-line processing error.")
     elif exit_code == 6:
         return InvalidArchitecture("Invalid architecture.")
+    elif exit_code == 7:
+        return BadOption("Invalid option value.")
     elif exit_code == 10:
         return BuildError("Error during rpmbuild phase. Check the build.log.")
     elif exit_code == 11:
@@ -180,6 +183,13 @@ class InvalidArchitecture(Error):
     def __init__(self, *args):
         super().__init__(*args)
         self.resultcode = 6
+
+
+class BadOption(Error):
+    "invalid, unsupported, or incompatible option value"
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.resultcode = 7
 
 
 class ResultDirNotAccessible(Error):

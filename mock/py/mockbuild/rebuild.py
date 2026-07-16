@@ -63,8 +63,7 @@ def do_rebuild(config_opts, commands, buildroot, options, srpms):
     clean = config_opts['clean'] and not config_opts['scm']
 
     def build(srpm):
-        commands.build(srpm, timeout=config_opts['rpmbuild_timeout'],
-                       check=config_opts['check'], spec=options.spec)
+        commands.build(srpm, spec=options.spec)
 
     def post_build():
         if config_opts['post_install']:
@@ -98,7 +97,6 @@ def do_buildsrpm(config_opts, commands, buildroot, options, args):
 
     def cmd(spec):
         return commands.buildsrpm(spec=spec, sources=options.sources,
-                                  timeout=config_opts['rpmbuild_timeout'],
                                   follow_links=options.symlink_dereference)
 
     return rebuild_generic([options.spec], commands, buildroot, config_opts,

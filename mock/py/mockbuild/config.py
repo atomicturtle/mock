@@ -74,6 +74,7 @@ def setup_default_config_opts():
     config_opts['cache_topdir'] = '/var/cache/mock'
     config_opts['clean'] = True
     config_opts['check'] = True
+    config_opts['separate_check'] = 'off'
     config_opts['post_install'] = False
     config_opts['chroothome'] = '/builddir'
     config_opts['log_config_file'] = 'logging.ini'
@@ -93,6 +94,7 @@ def setup_default_config_opts():
     config_opts['online'] = True
     config_opts['isolation'] = None
     config_opts['use_nspawn'] = None
+    config_opts['pivot_root_chroot'] = False
     config_opts['rpmbuild_networking'] = False
     config_opts['nspawn_args'] = ['--capability=cap_ipc_lock']
     # FIXME disable as default because of https://github.com/rpm-software-management/mock/issues/1641
@@ -690,6 +692,9 @@ def set_config_opts_per_cmdline(config_opts, options, args):
     if options.short_circuit:
         config_opts['short_circuit'] = options.short_circuit
         config_opts['clean'] = False
+
+    if options.separate_check:
+        config_opts['separate_check'] = options.separate_check
 
     if options.rpmbuild_opts:
         config_opts['rpmbuild_opts'] = options.rpmbuild_opts
