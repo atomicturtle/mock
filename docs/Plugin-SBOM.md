@@ -7,9 +7,10 @@ This plugin generates a Software Bill of Materials (SBOM) in CycloneDX format fo
 
 ## Features
 
-* Generates SBOM in CycloneDX 1.5 format (JSON) and SPDX 2.3 format
+* Generates SBOM in CycloneDX 1.6 format (JSON) and SPDX 2.3 format
 * Deep Chroot Integration:
-  * Uses the target distribution's own `rpm` binary via `doChroot` for metadata extraction, ensuring 100% version compatibility across different distributions.
+  * Queries the target RPM database via host/bootstrap `rpm --root` using `doOutChroot`
+    (same pattern as `package_state` / `buildroot_lock`), avoiding fragile in-chroot RPM.
   * Correctly handles path mapping between chroot and host environments.
 * Captures detailed information about:
   * Source files and patches from spec files with a resilient regex-based fallback for legacy/strict syntax errors.
@@ -20,6 +21,10 @@ This plugin generates a Software Bill of Materials (SBOM) in CycloneDX format fo
 * Optimized Performance: Consolidated file listing and metadata extraction into a single pass.
 * Outputs SBOM in the build results directory.
 * Compatible with security scanners (Grype, Trivy, Snyk).
+* Standalone CLI: `mock-sbom-generator` can generate an SBOM from a result directory
+  without running a full Mock build. The plugin invokes this tool after the build.
+* Retains `sbom-prebuild.json` in the result directory as a forensic snapshot of
+  pre-build sources/spec metadata.
 
 ## Usage
 
@@ -116,6 +121,8 @@ The plugin supports several configuration options to control SBOM generation:
 ```python
 config_opts['plugin_conf']['sbom_generator_opts'] = {
     'generate_sbom': True,              # Enable SBOM generation (default: True)
+    'type': 'cyclonedx',                # 'cyclonedx' or 'spdx'
+    'command': '/usr/bin/mock-sbom-generator',  # Standalone generator executable
     'include_file_components': True,    # Include file-level components (default: True)
     'include_file_dependencies': False, # Include file-to-package dependencies (default: False)
     'include_debug_files': False,       # Include debug files in file components (default: False)
@@ -124,8 +131,21 @@ config_opts['plugin_conf']['sbom_generator_opts'] = {
 }
 ```
 
+**Standalone usage (no Mock build required):**
+
+```bash
+mock-sbom-generator --type cyclonedx \
+    --resultdir /var/lib/mock/fedora-rawhide-x86_64/result \
+    --root /var/lib/mock/fedora-rawhide-x86_64/root
+```
+
 **Configuration Options Explained:**
 
+- `type`: SBOM format (`cyclonedx` or `spdx`).
+- `command`: Path to the `mock-sbom-generator` executable invoked by the plugin.
+- `generate_cpe`: When enabled, emit heuristic CPE identifiers labeled with
+  `mock:cpe:confidence=heuristic` (default: `False` — off, to avoid false
+  vulnerability matches from fabricated CPEs).
 - `include_file_components`: When enabled, creates individual file components for each file in built packages, including hashes, permissions, and ownership information.
 - `include_file_dependencies`: Creates dependency relationships showing which files belong to which packages.
 - `include_debug_files`: Filters out debug files (`.debug`, files in `/usr/lib/debug`) from file components.
@@ -134,12 +154,23 @@ config_opts['plugin_conf']['sbom_generator_opts'] = {
 
 ## Output
 
-The plugin generates a file named `<name>-<version>-<release>.sbom` (for CycloneDX) or `<name>-<version>-<release>.spdx.json` (for SPDX) in the build results directory. The SBOM includes:
+The plugin generates a file named `<name>-<version>-<release>.sbom` (for CycloneDX) or `<name>-<version>-<release>.spdx.json` (for SPDX) in the build results directory (never a generic name like `plugin.sbom`). The SBOM includes:
 
 * CycloneDX/SPDX document metadata
   * Build timestamp
   * Tool information (Mock SBOM Generator)
   * Mock-specific build properties (host, distribution, chroot, config)
+  * Network / isolation status from the live Mock build:
+    * `mock:build:network:online` (`config_opts['online']`)
+    * `mock:build:network:rpmbuild` (`config_opts['rpmbuild_networking']`)
+    * `mock:build:isolation` / `mock:build:nspawn` when set
+  * Evidence-backed completeness: `sbom:completeness` is computed from collector
+    success (`complete` / `partial` / `minimal`); failures are listed in
+    `mock:sbom:collection_errors`
+  * Signature status tri-state: `verified` / `present-unverified` / `unsigned`
+    (never claims valid without cryptographic check)
+  * Host forensics: kernel, SELinux mode, host distribution
+  * Sidecar digest: `<sbom>.sha256`
   * RPM header metadata surfaced at the document level (buildhost, buildtime, source RPM, group, epoch, distribution, manufacture/vendor)
 * Components array containing:
   * Built packages (type: "library" or "application")
@@ -164,12 +195,31 @@ The plugin generates a file named `<name>-<version>-<release>.sbom` (for Cyclone
   * Dependency relationships modeled using bom-refs
   * Note: Source code relationships are represented in component properties and the components array, not in the dependencies section (source code is a build input, not a runtime dependency)
 
+### Interpreting auditor WARN findings
+
+When auditing with `sbom-auditor`, some WARN results are expected depending on build policy:
+
+* **Hermetic Build** — PASS only when both `config_opts['online'] = False` and
+  `config_opts['rpmbuild_networking'] = False`. Default Mock configs that enable
+  network for dependency download correctly score WARN (`online=true`).
+* **Build-output signatures** — Freshly built binary RPMs and the *rebuilt*
+  result-dir ``*.src.rpm`` correctly report `mock:signature:status=unsigned`.
+  Chain-of-custody checks the *input* SRPM from Mock's
+  ``builddir/build/originals/`` (captured at prebuild). A signed vendor SRPM
+  should appear as a build-input with `mock:source:type=source_rpm`. Toolchain
+  packages from the chroot must report `verified` (or `present-unverified` if
+  the keyring cannot confirm the key). An all-unsigned toolchain is a generator
+  failure.
+* **Hardening `pie_enabled=false` / `fips_enabled=false`** — Flags are always
+  recorded; a false value is reported but does not by itself fail the audit when
+  the property is present.
+
 ## Example SBOM Structure
 
 ```json
 {
   "bomFormat": "CycloneDX",
-  "specVersion": "1.5",
+  "specVersion": "1.6",
   "serialNumber": "urn:uuid:...",
   "version": 1,
   "metadata": {

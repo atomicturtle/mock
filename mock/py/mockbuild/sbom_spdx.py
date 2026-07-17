@@ -59,23 +59,43 @@ class SpdxGenerator:
             "relationships": []
         }
 
-        # 1.5 Add Spec Metadata and Hardening Props to Document Comment
-        doc_metadata = []
+        # 1.5 Add Spec Metadata and Hardening Props as SPDX annotations
+        annotations = []
         if spec_metadata:
             build_reqs = spec_metadata.get("build_requires", [])
             if build_reqs:
-                doc_metadata.append(f"Build-Requires: {', '.join(build_reqs)}")
+                annotations.append({
+                    "annotationDate": creation_time,
+                    "annotationType": "OTHER",
+                    "annotator": "Tool: mock-sbom-generator",
+                    "comment": f"mock:spec:build_requires={','.join(build_reqs)}",
+                })
             reqs = spec_metadata.get("requires", [])
             if reqs:
-                doc_metadata.append(f"Requires: {', '.join(reqs)}")
+                annotations.append({
+                    "annotationDate": creation_time,
+                    "annotationType": "OTHER",
+                    "annotator": "Tool: mock-sbom-generator",
+                    "comment": f"mock:spec:requires={','.join(reqs)}",
+                })
 
-        # Hardening flags
+        # Hardening flags / network props as machine-readable annotations
         if hardening_props:
             for prop in hardening_props:
-                doc_metadata.append(f"{prop['name']}: {prop['value']}")
+                annotations.append({
+                    "annotationDate": creation_time,
+                    "annotationType": "OTHER",
+                    "annotator": "Tool: mock-sbom-generator",
+                    "comment": f"{prop['name']}={prop['value']}",
+                })
 
-        if doc_metadata:
-            document["comment"] = " | ".join(doc_metadata)
+        if annotations:
+            document["annotations"] = annotations
+            # Keep a short human-readable summary in comment for older consumers
+            document["comment"] = (
+                f"{len(annotations)} build metadata annotations; "
+                "see annotations[] for structured details."
+            )
 
         # Virtual Grouping Refs
         inputs_ref = "SPDXRef-Build-Inputs"
@@ -129,8 +149,8 @@ class SpdxGenerator:
         signer_groups = {}
         for tc_pkg in build_toolchain_packages:
             sig_info = tc_pkg.get("digital_signature", {})
-            key_id = sig_info.get("signature_key", "unsigned")
-            
+            key_id = sig_info.get("signature_key") or "unsigned"
+
             if key_id not in signer_groups:
                 safe_key = re.sub(r'[^a-zA-Z0-9.-]', '-', key_id)
                 signer_ref = f"SPDXRef-Signer-{safe_key}"
@@ -273,34 +293,23 @@ class SpdxGenerator:
             except (ValueError, TypeError):
                 pass
 
-        # GPG Signature Information
-        signature = self.rpm_helper.get_rpm_signature(rpm_path)
-        if signature:
-            metadata_fields.append(f"GPG Signature: {signature}")
-
-        if metadata_fields:
-            package["comment"] = " | ".join(metadata_fields)
-
-        # Checksums
-        rpm_hash = pkg_data.get("sha256")
-        if not rpm_hash or rpm_hash == "(none)":
-            rpm_hash = self.rpm_helper.hash_file(rpm_path)
-            
-        if rpm_hash:
-            package["checksums"] = [{"algorithm": "SHA256", "checksumValue": rpm_hash}]
-
         # External References (CPE and PURL)
         external_refs = []
-        vendor = pkg_data.get("vendor")
-        cpe = self.rpm_helper.generate_cpe(name, version, vendor=vendor)
-        if cpe:
-            external_refs.append({
-                "referenceCategory": "SECURITY",
-                "referenceType": "cpe23Type",
-                "referenceLocator": cpe
-            })
+        if self.conf.get("generate_cpe", False):
+            vendor = pkg_data.get("vendor")
+            cpe, confidence = self.rpm_helper.generate_cpe(name, version, vendor=vendor)
+            if cpe:
+                external_refs.append({
+                    "referenceCategory": "SECURITY",
+                    "referenceType": "cpe23Type",
+                    "referenceLocator": cpe,
+                    "comment": f"confidence={confidence}",
+                })
             
-        purl = self.rpm_helper.generate_purl(name, full_version, distro_obj, pkg_data.get("arch"))
+        purl = self.rpm_helper.generate_purl(
+            name, full_version, distro_obj, pkg_data.get("arch"),
+            epoch=pkg_data.get("epoch"),
+        )
         if purl:
             external_refs.append({
                 "referenceCategory": "PACKAGE-MANAGER",
@@ -310,6 +319,22 @@ class SpdxGenerator:
 
         if external_refs:
             package["externalRefs"] = external_refs
+
+        # Evidence-backed signature status
+        sig_info = self.rpm_helper.verify_rpm_signature(rpm_path)
+        status = sig_info.get("signature_status", "unsigned")
+        metadata_fields.append(f"Signature Status: {status}")
+        if sig_info.get("signature_key"):
+            metadata_fields.append(f"GPG Key: {sig_info['signature_key']}")
+
+        if metadata_fields:
+            package["comment"] = " | ".join(metadata_fields)
+
+        rpm_hash = pkg_data.get("sha256")
+        if not rpm_hash or rpm_hash == "(none)":
+            rpm_hash = self.rpm_helper.hash_file(rpm_path)
+        if rpm_hash:
+            package["checksums"] = [{"algorithm": "SHA256", "checksumValue": rpm_hash}]
 
         return package
 
@@ -381,8 +406,12 @@ class SpdxGenerator:
             file_obj["checksums"] = [{"algorithm": "SHA256", "checksumValue": sha256}]
 
         # Store GPG flag as a comment if present
-        if file_data.get("digital_signature"):
-            file_obj["comment"] = f"Signature Status: {file_data['digital_signature']}"
+        sig = file_data.get("digital_signature")
+        if isinstance(sig, dict):
+            status = sig.get("signature_status") or sig.get("signature_type") or "unknown"
+            file_obj["comment"] = f"Signature Status: {status}"
+        elif sig:
+            file_obj["comment"] = f"Signature Status: {sig}"
 
         return file_obj
 
@@ -395,12 +424,23 @@ class SpdxGenerator:
             f_data = file_info[filename]
             # Ensure filename is in the data dict for create_spdx_file
             f_data["filename"] = filename
-            
-            # Filtering logic (man pages, debug files)
-            if not self.include_debug_files and (".build-id" in filename or ".debug" in filename):
-                continue
-            if not self.include_man_pages and ("/usr/share/man" in filename or "/usr/share/info" in filename):
-                continue
+
+            # Shared filter with CycloneDX
+            if not self.include_debug_files:
+                if (
+                    '/usr/lib/debug/' in filename
+                    or '/usr/src/debug/' in filename
+                    or filename.endswith('.debug')
+                    or '.build-id' in filename
+                ):
+                    continue
+            if not self.include_man_pages:
+                if (
+                    '/usr/share/man' in filename
+                    or '/usr/share/info' in filename
+                    or (filename.endswith('.gz') and '/man' in filename)
+                ):
+                    continue
 
             f_obj = self.create_spdx_file(f_data, parent_pkg_id=parent_spdx_id)
             if f_obj:

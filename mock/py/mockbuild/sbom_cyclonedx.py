@@ -49,7 +49,10 @@ class CycloneDxGenerator:
         full_version = f"{version}-{release}" if release else version
 
         # Generate PURL and bom-ref
-        purl = self.rpm_helper.generate_purl(package_name, full_version, distro_obj, arch)
+        purl = self.rpm_helper.generate_purl(
+            package_name, full_version, distro_obj, arch,
+            epoch=package_data.get("epoch"),
+        )
         bom_ref = purl
 
         # Determine component type (application vs library)
@@ -60,20 +63,28 @@ class CycloneDxGenerator:
             "bom-ref": bom_ref,
             "name": package_name,
             "version": full_version,
-            "purl": purl
+            "purl": purl,
+            "properties": [],
         }
 
-        # Add external references (CPE)
-        vendor = package_data.get("vendor")
-        cpe = self.rpm_helper.generate_cpe(package_name, version, vendor=vendor)
-        if cpe:
-            component["externalReferences"] = [
-                {
-                    "type": "other",
-                    "comment": "CPE 2.3",
-                    "url": cpe
-                }
-            ]
+        # Add external references (CPE) — heuristic only when enabled
+        if self.conf.get("generate_cpe", False):
+            vendor = package_data.get("vendor")
+            cpe, confidence = self.rpm_helper.generate_cpe(
+                package_name, version, vendor=vendor
+            )
+            if cpe:
+                component["externalReferences"] = [
+                    {
+                        "type": "other",
+                        "comment": f"CPE 2.3 ({confidence})",
+                        "url": cpe
+                    }
+                ]
+                component.setdefault("properties", []).append({
+                    "name": "mock:cpe:confidence",
+                    "value": confidence,
+                })
 
         # Add license information
         license_str = package_data.get("license")
@@ -130,47 +141,30 @@ class CycloneDxGenerator:
         if summary and summary != "(none)":
             component["description"] = summary
 
-        # Add GPG signature information if available
-        signature = self.rpm_helper.get_rpm_signature(rpm_path)
-        if signature:
-            # Parse signature info
-            sig_props = self.parse_signature_to_properties(signature)
+        # Add GPG signature information if available (verified when possible)
+        sig_info = self.rpm_helper.verify_rpm_signature(rpm_path)
+        if sig_info:
+            sig_props = self.signature_info_to_properties(sig_info)
             properties.extend(sig_props)
 
         if properties:
             component["properties"] = properties
 
+        # Package-level integrity hash (header digest or file digest)
+        pkg_hash = package_data.get("sha256")
+        if not pkg_hash or pkg_hash == "(none)":
+            host_path = self.rpm_helper._host_path(rpm_path)
+            if os.path.isfile(host_path):
+                pkg_hash = self.rpm_helper.hash_file(host_path)
+        if pkg_hash and pkg_hash != "(none)":
+            component["hashes"] = [{"alg": "SHA-256", "content": pkg_hash}]
+
         return component
 
     def parse_signature_to_properties(self, signature_string):
-        """Parses RPM signature string into CycloneDX properties."""
-        properties = []
-        if not signature_string or signature_string == "(none)":
-            return properties
-
-        properties.append({"name": "mock:signature:type", "value": "GPG"})
-
-        if "RSA/SHA256" in signature_string:
-            properties.append({"name": "mock:signature:algorithm", "value": "RSA/SHA256"})
-        elif "DSA/SHA1" in signature_string:
-            properties.append({"name": "mock:signature:algorithm", "value": "DSA/SHA1"})
-        elif "ECDSA/SHA256" in signature_string:
-            properties.append({"name": "mock:signature:algorithm", "value": "ECDSA/SHA256"})
-        elif "Ed25519/SHA256" in signature_string:
-            properties.append({"name": "mock:signature:algorithm", "value": "Ed25519/SHA256"})
-
-        key_id_match = re.search(r'Key ID ([0-9a-fA-F]+)', signature_string)
-        if key_id_match:
-            properties.append({"name": "mock:signature:key", "value": key_id_match.group(1)})
-
-        date_match = re.search(
-            r'([A-Za-z]{3} [A-Za-z]{3}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4})', signature_string
-        )
-        if date_match:
-            properties.append({"name": "mock:signature:date", "value": date_match.group(1)})
-
-        properties.append({"name": "mock:signature:raw", "value": signature_string})
-        return properties
+        """Parses RPM signature string into CycloneDX properties (unverified)."""
+        info = self.rpm_helper._parse_signature_data(signature_string)
+        return self.signature_info_to_properties(info)
 
     def signature_info_to_properties(self, signature_info):
         """Converts signature info dict to CycloneDX properties."""
@@ -178,11 +172,15 @@ class CycloneDxGenerator:
         sig_type = signature_info.get("signature_type", "unsigned")
         properties.append({"name": "mock:signature:type", "value": sig_type})
 
-        if (
-            sig_type not in ('unsigned', 'unknown') and
-            'missing key' not in sig_type and
-            'BAD' not in sig_type
-        ):
+        status = signature_info.get("signature_status", "unsigned")
+        properties.append({"name": "mock:signature:status", "value": status})
+        # signature_valid is True only when cryptographically verified
+        properties.append({
+            "name": "mock:signature:valid",
+            "value": str(bool(signature_info.get("signature_valid"))).lower(),
+        })
+
+        if status != "unsigned":
             algorithm = signature_info.get("signature_algorithm")
             if algorithm:
                 properties.append({"name": "mock:signature:algorithm", "value": algorithm})
@@ -195,25 +193,32 @@ class CycloneDxGenerator:
             if sig_date:
                 properties.append({"name": "mock:signature:date", "value": sig_date})
 
-            sig_valid = signature_info.get("signature_valid", False)
-            properties.append({"name": "mock:signature:valid", "value": str(sig_valid).lower()})
-
             raw_data = signature_info.get("raw_signature_data")
             if raw_data:
                 properties.append({"name": "mock:signature:raw", "value": raw_data})
 
         return properties
 
-    def create_cyclonedx_document(self):
-        """Initializes the base CycloneDX JSON structure."""
+    def create_cyclonedx_document(self, serial_seed=None):
+        """Initializes the base CycloneDX JSON structure.
+
+        When SOURCE_DATE_EPOCH is set and serial_seed is provided, the
+        serialNumber is a deterministic UUIDv5 so rebuilds are bit-stable.
+        """
+        epoch = os.environ.get("SOURCE_DATE_EPOCH")
+        if epoch and str(epoch).isdigit() and serial_seed:
+            serial = uuid.uuid5(uuid.NAMESPACE_URL, f"mock-sbom:{epoch}:{serial_seed}")
+        else:
+            serial = uuid.uuid4()
         return {
             "bomFormat": "CycloneDX",
-            "specVersion": "1.5",
-            "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+            "specVersion": "1.6",
+            "serialNumber": f"urn:uuid:{serial}",
             "version": 1,
             "metadata": {},
             "components": [],
-            "dependencies": []
+            "dependencies": [],
+            "formulation": [],
         }
 
     def generate_bom_ref(self, package_name, version, _component_type="package"):
@@ -248,23 +253,46 @@ class CycloneDxGenerator:
         filename = source_file["filename"]
         sha256 = source_file.get("sha256")
         sig = source_file.get("digital_signature")
+        source_type = source_file.get("source_type")
+        is_srpm = (
+            source_type == "source_rpm"
+            or (filename or "").endswith(".src.rpm")
+        )
 
         safe_name = re.sub(r'[^a-zA-Z0-9.-]', '-', filename)
         hash_suffix = sha256[:8] if sha256 else "unknown"
         bom_ref = f"source-file:{safe_name}-{hash_suffix}"
+
+        if is_srpm:
+            type_value = "source_rpm"
+        elif self.is_patch_file(filename):
+            type_value = "patch"
+        else:
+            type_value = "source"
 
         comp = {
             "type": "file",
             "bom-ref": bom_ref,
             "name": filename,
             "properties": [
-                {"name": "mock:source:type", "value": "patch" if self.is_patch_file(filename) else "source"}
+                {"name": "mock:source:type", "value": type_value}
             ]
         }
+        if is_srpm:
+            comp["properties"].append({
+                "name": "mock:rpm:filename",
+                "value": filename,
+            })
         if sha256:
             comp["hashes"] = [{"alg": "SHA-256", "content": sha256}]
-        if sig:
-            comp["properties"].append({"name": "mock:signature:info", "value": sig})
+        if isinstance(sig, dict):
+            comp["properties"].extend(self.signature_info_to_properties(sig))
+        elif sig:
+            # Legacy string form from older prebuild snapshots
+            if isinstance(sig, str) and ("Key ID" in sig or "RSA/" in sig or "GPG" in sig):
+                comp["properties"].extend(self.parse_signature_to_properties(sig))
+            else:
+                comp["properties"].append({"name": "mock:signature:info", "value": str(sig)})
 
         return comp
 
@@ -325,35 +353,36 @@ class CycloneDxGenerator:
         """
         Attempts to map a raw RPM dependency string (e.g., 'libc.so.6', 'bash >= 4.0')
         to a concrete bom-ref in the component_map.
+
+        ``component_map`` keys are lowercased package names; values must be the
+        same bom-ref/purl already used on the component (including arch/epoch).
         """
         if not dependency_string:
             return None
 
         clean_dep = dependency_string.strip()
-        
-        if " " in clean_dep:
-            # Handle forms like 'bash >= 5.0' -> just look for 'bash'
-            pkg_name = clean_dep.split()[0].strip()
-            # If the requirement is a package name we know about
-            if pkg_name in component_map:
-                return component_map[pkg_name]
+        if not clean_dep:
+            return None
 
-            # Sometimes dependencies look like 'config(bash) = 5.0'
+        def _lookup(name):
+            if not name:
+                return None
+            return component_map.get(name.lower())
+
+        # Forms like 'bash >= 5.0' or 'config(bash) = 5.0'
+        if " " in clean_dep or clean_dep.startswith("config("):
+            pkg_name = clean_dep.split()[0].strip()
+            hit = _lookup(pkg_name)
+            if hit:
+                return hit
             if clean_dep.startswith("config(") and ")" in clean_dep:
                 inner_name = clean_dep[7:clean_dep.find(")")]
-                if inner_name in component_map:
-                    return component_map[inner_name]
+                return _lookup(inner_name)
+            return None
 
-        else:
-            # Handle raw names like 'bash' or 'libc.so.6'
-            if clean_dep in component_map:
-                return component_map[clean_dep]
+        # Raw names like 'bash' (capability names like libc.so.6 usually miss)
+        return _lookup(clean_dep)
 
-            # Check if any component *provides* this string (this is an approximation, 
-            # true resolution requires full RPM capability mapping which is slow)
-            # For now, we rely on the direct package name match which covers 80% of cases.
-
-        return None
     def process_built_packages(self, bom, rpm_files, build_dir, distro_id,
                                source_component_entries, build_subject_name,
                                build_toolchain_packages, toolchain_bom_refs):
@@ -363,12 +392,17 @@ class CycloneDxGenerator:
         component_map = {}
         primary_rpm_metadata = None
 
-        # Build component map from toolchain packages
+        # Build component map from toolchain packages — PURLs must match
+        # create_toolchain_component (arch + epoch) or dependsOn refs dangle.
         for toolchain_pkg in build_toolchain_packages:
             pkg_name = toolchain_pkg.get("name")
             pkg_version = toolchain_pkg.get("version")
             if pkg_name and pkg_version:
-                purl = self.rpm_helper.generate_purl(pkg_name, pkg_version, distro_id)
+                purl = self.rpm_helper.generate_purl(
+                    pkg_name, pkg_version, distro_id,
+                    arch=toolchain_pkg.get("arch"),
+                    epoch=toolchain_pkg.get("epoch"),
+                )
                 component_map[pkg_name.lower()] = purl
 
         for rpm_file in rpm_files:
@@ -414,7 +448,7 @@ class CycloneDxGenerator:
                 # Extract CPE and GPG info from the component to pass to files
                 rpm_cpe = None
                 for ext_ref in component.get("externalReferences", []):
-                    if ext_ref.get("comment") == "CPE 2.3":
+                    if "CPE 2.3" in (ext_ref.get("comment") or ""):
                         rpm_cpe = ext_ref.get("url")
                 
                 rpm_gpg = None
@@ -461,10 +495,12 @@ class CycloneDxGenerator:
                         all_depends_on.append(t_ref)
 
             all_depends_on = sorted(list(set(all_depends_on)))
-            if all_depends_on:
-                bom["dependencies"].append({"ref": bom_ref, "dependsOn": all_depends_on})
-            elif runtime_dependency:
-                bom["dependencies"].append(runtime_dependency)
+            # Always record the output package in the dependency graph so
+            # auditors can verify every build-output appears as a subject.
+            bom["dependencies"].append({
+                "ref": bom_ref,
+                "dependsOn": all_depends_on,
+            })
                 
             all_built_components.append(component)
 
@@ -610,142 +646,110 @@ class CycloneDxGenerator:
                                 source_components=None,
                                 toolchain_components=None,
                                 all_built_components=None):
-        """Finalizes BOM dependencies, linking primary package to hierarchical grouping components
-        and implementing nested component composition."""
-        # Find primary component ref (metadata.component or first built package)
+        """Wire dependencies and emit a CycloneDX 1.6 formulation.
+
+        Real packages/files stay in ``components`` (scanner-friendly flat list).
+        Build Inputs / Toolchain / Outputs roles are described in ``formulation``
+        instead of nested grouping nodes under metadata.component.
+        """
         primary_ref = None
         if bom.get("metadata") and bom["metadata"].get("component"):
             primary_ref = bom["metadata"]["component"].get("bom-ref")
-        
+
         if not primary_ref:
             return
 
-        # Create virtual grouping references
-        inputs_ref = "build:inputs"
-        toolchain_ref = "build:toolchain"
-        outputs_ref = "build:outputs"
-
-        # Prepare grouping components
-        inputs_group = {
-            "type": "application",
-            "bom-ref": inputs_ref,
-            "name": "Build Inputs",
-            "description": "Source code and patches used for the build",
-            "properties": [{"name": "mock:type", "value": "grouping-node"}]
-        }
-        if source_components:
-            inputs_group["components"] = sorted(source_components, key=lambda x: x.get("name", ""))
-
-        toolchain_group = {
-            "type": "application",
-            "bom-ref": toolchain_ref,
-            "name": "Build Toolchain",
-            "description": "Packages and tools used to perform the build",
-            "scope": "excluded", # Tools are not part of the runtime payload
-            "properties": [{"name": "mock:type", "value": "grouping-node"}]
-        }
+        # Flatten toolchain into the top-level component inventory
         if toolchain_components:
-            # Group toolchain components by their GPG Key ID
-            signer_groups = {}
             pkg_map = {p.get("name"): p for p in build_toolchain_packages}
-            
             for comp in toolchain_components:
                 comp["scope"] = "excluded"
                 pkg_info = pkg_map.get(comp.get("name"))
                 sig_info = pkg_info.get("digital_signature", {}) if pkg_info else {}
-                key_id = sig_info.get("signature_key", "unsigned")
-                
-                # Attach signature properties to the individual package component
                 if sig_info:
                     sig_props = self.signature_info_to_properties(sig_info)
-                    comp["properties"] = comp.get("properties", [])
-                    comp["properties"].extend([p for p in sig_props if p["name"] != "mock:signature:raw"])
-
-                if key_id not in signer_groups:
-                    # Create group properties - common only to the signer
-                    group_props = [
-                        {"name": "mock:role", "value": "build-toolchain"},
-                        {"name": "mock:type", "value": "signer-group"},
-                        {"name": "mock:signature:key", "value": key_id}
-                    ]
-                    
-                    signer_groups[key_id] = {
-                        "type": "application",
-                        "bom-ref": f"signer:{key_id}",
-                        "name": f"Packages signed by {key_id}" if key_id != "unsigned" else "Unsigned Packages",
-                        "scope": "excluded",
-                        "properties": group_props,
-                        "components": []
-                    }
-                signer_groups[key_id]["components"].append(comp)
-            
-            # Add signer groups as children of toolchain_group
-            sorted_groups = sorted(
-                list(signer_groups.values()), 
-                key=lambda x: x.get("name", "")
-            )
-            for group in sorted_groups:
-                group["components"].sort(key=lambda x: x.get("name", ""))
-            
-            toolchain_group["components"] = sorted_groups
-
-        outputs_group = {
-            "type": "application",
-            "bom-ref": outputs_ref,
-            "name": "RPM Contents",
-            "description": "RPM packages and their contained files produced by the build",
-            "scope": "required",
-            "properties": [{"name": "mock:type", "value": "grouping-node"}]
-        }
-        if all_built_components:
-            outputs_group["components"] = sorted(all_built_components, key=lambda x: x.get("name", ""))
-
-        # Nest groups into the primary component
-        primary_comp = bom["metadata"]["component"]
-        primary_comp["components"] = [inputs_group, toolchain_group, outputs_group]
-        # Sort metadata components alphabetically
-        primary_comp["components"].sort(key=lambda x: x.get("name", ""))
-
-        # 1. Primary component depends on the three groups
-        bom["dependencies"].append({
-            "ref": primary_ref,
-            "dependsOn": sorted([inputs_ref, toolchain_ref, outputs_ref])
-        })
-
-        # 2. Build Inputs Group -> Source components
-        input_deps = []
-        for entry in source_component_entries:
-            if entry.get("bom-ref"):
-                input_deps.append(entry["bom-ref"])
-        
-        if input_deps:
-            bom["dependencies"].append({
-                "ref": inputs_ref,
-                "dependsOn": sorted(list(set(input_deps)))
-            })
-
-        # 3. Build Toolchain Group -> Signer Groups
-        signer_refs = [g["bom-ref"] for g in toolchain_group.get("components", [])]
-        if signer_refs:
-            bom["dependencies"].append({
-                "ref": toolchain_ref,
-                "dependsOn": sorted(signer_refs)
-            })
-            
-            # 3b. Signer Groups -> Individual packages
-            for group in toolchain_group["components"]:
-                pkg_refs = [c["bom-ref"] for c in group["components"]]
-                bom["dependencies"].append({
-                    "ref": group["bom-ref"],
-                    "dependsOn": sorted(pkg_refs)
+                    comp.setdefault("properties", [])
+                    comp["properties"].extend(
+                        [p for p in sig_props if p["name"] != "mock:signature:raw"]
+                    )
+                comp.setdefault("properties", []).append({
+                    "name": "mock:role",
+                    "value": "build-toolchain",
                 })
+                bom["components"].append(comp)
 
-        # 4. RPM Contents Group -> Built RPMs (Packages)
-        if built_package_bom_refs:
+        if source_components:
+            for comp in source_components:
+                # Already in bom["components"] via add_source_components; tag role.
+                props = comp.setdefault("properties", [])
+                if not any(p.get("name") == "mock:role" for p in props):
+                    props.append({"name": "mock:role", "value": "build-input"})
+
+        if all_built_components:
+            for comp in all_built_components:
+                props = comp.setdefault("properties", [])
+                if not any(p.get("name") == "mock:role" for p in props):
+                    props.append({"name": "mock:role", "value": "build-output"})
+
+        # Primary depends on inputs + toolchain + outputs (by bom-ref)
+        depends_on = []
+        input_refs = [
+            e["bom-ref"] for e in source_component_entries if e.get("bom-ref")
+        ]
+        depends_on.extend(input_refs)
+        depends_on.extend(toolchain_bom_refs or [])
+        depends_on.extend(built_package_bom_refs or [])
+        if depends_on:
             bom["dependencies"].append({
-                "ref": outputs_ref,
-                "dependsOn": sorted(list(set(built_package_bom_refs)))
+                "ref": primary_ref,
+                "dependsOn": sorted(set(depends_on)),
             })
+
+        # CycloneDX 1.6 formulation: describe the build without grouping nodes
+        workflow = {
+            "bom-ref": "mock:workflow:rpmbuild",
+            "uid": "mock-rpmbuild",
+            "name": "Mock RPM Build",
+            "taskTypes": ["build"],
+            "inputs": [
+                {"source": {"ref": ref}} for ref in sorted(set(input_refs))
+            ],
+            "outputs": [
+                {
+                    "type": "artifact",
+                    "source": {"ref": ref},
+                }
+                for ref in sorted(set(built_package_bom_refs or []))
+            ],
+            "properties": [
+                {
+                    "name": "mock:toolchain:count",
+                    "value": str(len(toolchain_bom_refs or [])),
+                },
+                {
+                    "name": "mock:toolchain:note",
+                    "value": (
+                        "Build toolchain packages are listed in components[] "
+                        "with scope=excluded and mock:role=build-toolchain"
+                    ),
+                },
+            ],
+        }
+
+        bom["formulation"] = [{
+            "bom-ref": "mock:formulation:build",
+            "components": [
+                {
+                    "type": "application",
+                    "bom-ref": "mock:tool:mock-sbom-generator",
+                    "name": "mock-sbom-generator",
+                    "description": "Mock SBOM generator capturing build provenance",
+                }
+            ],
+            "workflows": [workflow],
+        }]
+        # Drop legacy misspelled key if a prior partial write left it
+        bom.pop("formulations", None)
 
 
 
@@ -758,7 +762,11 @@ class CycloneDxGenerator:
             return None
 
         # Generate PURL and bom-ref
-        purl = self.rpm_helper.generate_purl(package_name, version, distro_obj, arch=toolchain_pkg.get("arch"))
+        purl = self.rpm_helper.generate_purl(
+            package_name, version, distro_obj,
+            arch=toolchain_pkg.get("arch"),
+            epoch=toolchain_pkg.get("epoch"),
+        )
         bom_ref = purl
 
         component = {
@@ -766,31 +774,24 @@ class CycloneDxGenerator:
             "bom-ref": bom_ref,
             "name": package_name,
             "version": version,
-            "purl": purl
+            "purl": purl,
+            "properties": [],
         }
 
-        # Add checksum - REMOVED per user request to only have hashes for files contained in RPM
-        # (This follows the rule that only the 'RPM Contents' section should have hashes)
-        # checksum = toolchain_pkg.get("checksum")
-        # if checksum and checksum != "error" and not checksum.startswith("error"):
-        #     if len(checksum) == 64:
-        #         alg = "SHA-256"
-        #     elif len(checksum) == 40:
-        #         alg = "SHA-1"
-        #     else:
-        #         alg = "SHA-256"
-        #     component["hashes"] = [{"alg": alg, "content": checksum}]
-
-        # Add CPE
+        # Add CPE only when explicitly enabled
         cpe = toolchain_pkg.get("cpe")
         if cpe:
             component["externalReferences"] = [
                 {
                     "type": "other",
-                    "comment": "CPE 2.3",
+                    "comment": f"CPE 2.3 ({toolchain_pkg.get('cpe_confidence', 'heuristic')})",
                     "url": cpe
                 }
             ]
+            component["properties"].append({
+                "name": "mock:cpe:confidence",
+                "value": toolchain_pkg.get("cpe_confidence", "heuristic"),
+            })
 
         # Add license
         license_str = toolchain_pkg.get("licenseDeclared")
@@ -801,20 +802,30 @@ class CycloneDxGenerator:
                 }
             ]
 
-        # Add properties
-        properties = []
+        # Repo/download URL from buildroot lock / repoquery when available
+        url = toolchain_pkg.get("url")
+        if url:
+            component.setdefault("externalReferences", []).append({
+                "type": "distribution",
+                "url": url,
+            })
 
-        # Add build date if available
+        # Package-level header digest when available from rpmdb
+        checksum = toolchain_pkg.get("checksum")
+        if checksum and checksum != "(none)":
+            component["hashes"] = [{"alg": "SHA-256", "content": checksum}]
+
+        # Add properties
         signature_info = toolchain_pkg.get("digital_signature", {})
         build_date = signature_info.get("build_date")
         if build_date:
-            properties.append({
+            component["properties"].append({
                 "name": "mock:build:date",
                 "value": build_date
             })
 
-        if properties:
-            component["properties"] = properties
+        if not component["properties"]:
+            del component["properties"]
 
         return component
 
@@ -836,19 +847,8 @@ class CycloneDxGenerator:
             if not file_path or not file_path.strip():
                 continue
 
-            # Filtering logic
-            if not self.include_debug_files and ("/usr/lib/debug/" in file_path or "/usr/src/debug/" in file_path):
-                self.buildroot.root_log.debug(f"[SBOM] Filtering debug file: {file_path}")
+            if not self.should_include_file(file_path):
                 continue
-            
-            if not self.include_man_pages and ("/usr/share/man/" in file_path):
-                self.buildroot.root_log.debug(f"[SBOM] Filtering man page: {file_path}")
-                continue
-
-            # Filter files based on configuration
-            if not self.include_debug_files:
-                if '/usr/lib/debug/' in file_path or file_path.endswith('.debug'):
-                    continue
 
             file_data = file_info.get(file_path, {})
             file_hash = file_data.get("hash")
@@ -919,23 +919,30 @@ class CycloneDxGenerator:
         return file_components
 
 
-    def should_include_file_dependency(self, file_path):
-        """Determine if a file should have a dependency entry."""
-        if not self.include_file_dependencies:
-            return False
-
-        # Filter out debug files if configured
+    def should_include_file(self, file_path):
+        """Shared file filter used by CDX (and mirrored by SPDX)."""
         if not self.include_debug_files:
-            if '/usr/lib/debug/' in file_path or file_path.endswith('.debug'):
+            if (
+                '/usr/lib/debug/' in file_path
+                or '/usr/src/debug/' in file_path
+                or file_path.endswith('.debug')
+                or '.build-id' in file_path
+            ):
                 return False
 
-        # Filter out man pages if configured
         if not self.include_man_pages:
             if (
-                '/usr/share/man/' in file_path or
-                (file_path.endswith('.gz') and '/man' in file_path)
+                '/usr/share/man/' in file_path
+                or '/usr/share/info/' in file_path
+                or (file_path.endswith('.gz') and '/man' in file_path)
             ):
                 return False
 
         return True
+
+    def should_include_file_dependency(self, file_path):
+        """Determine if a file should have a dependency entry."""
+        if not self.include_file_dependencies:
+            return False
+        return self.should_include_file(file_path)
 
