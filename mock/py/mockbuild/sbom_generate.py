@@ -5,14 +5,14 @@
 # Copyright (C) 2026, Atomicorp, Inc.
 """Core SBOM generation logic shared by the mock plugin and mock-sbom-generator."""
 
-from mockbuild.sbom_utils import RpmQueryHelper
+from mockbuild.sbom_utils import RpmQueryHelper, nevra_key
 from mockbuild.sbom_spdx import SpdxGenerator
 from mockbuild.sbom_cyclonedx import CycloneDxGenerator
 import os
 import json
 import subprocess
 import socket
-import traceback
+import tempfile
 from datetime import datetime, timezone
 
 from mockbuild.trace_decorator import traceLog
@@ -47,23 +47,22 @@ class SBOMGenerator:
         self.sbom_done = False
         self.prebuild_input_srpm = prebuild_input_srpm
 
-        # Configuration options for file-level dependencies and filtering
-        self.include_file_dependencies = self.conf.get('include_file_dependencies', False)
-        self.include_file_components = self.conf.get('include_file_components', True)
-        self.include_debug_files = self.conf.get('include_debug_files', False)
-        self.include_man_pages = self.conf.get('include_man_pages', True)
-        self.include_source_dependencies = self.conf.get('include_source_dependencies', True)
-        self.include_toolchain_dependencies = self.conf.get('include_toolchain_dependencies', False)
-
         self.prebuild_source_files = prebuild_source_files or []
         self.prebuild_spec_metadata = prebuild_spec_metadata or {}
         self.prebuild_capture_errors = list(prebuild_capture_errors or [])
         # Per-collector status for evidence-backed completeness
         self.collection_status = {}
         self.collection_errors = []
-        # Seed collection_errors from prebuild capture failures
-        for err in self.prebuild_capture_errors:
-            self.collection_errors.append(f"prebuild: {err}")
+        # Seed collector failure so completeness cannot stay "complete"
+        # when prebuild capture already failed.
+        if self.prebuild_capture_errors:
+            self._record_collector(
+                "prebuild",
+                False,
+                "; ".join(
+                    f"prebuild: {err}" for err in self.prebuild_capture_errors
+                ),
+            )
 
     def _record_collector(self, name, success, error=None):
         """Track success/failure of an SBOM data collector."""
@@ -253,9 +252,6 @@ class SBOMGenerator:
         hardening_props = self._collect_build_hardening_properties()
         if hardening_props:
             properties.extend(hardening_props)
-            self._record_collector("hardening_macros", True)
-        else:
-            self._record_collector("hardening_macros", False, "no hardening macros collected")
 
         # Refresh completeness now that collectors have run
         for prop in properties:
@@ -276,16 +272,24 @@ class SBOMGenerator:
         return metadata
 
     def _evaluate_rpm_macro(self, macro):
-        """Evaluate an RPM macro via host/bootstrap rpm with --root (doOutChroot)."""
+        """Evaluate an RPM macro via host/bootstrap rpm with --root (doOutChroot).
+
+        Returns empty string when no usable buildroot is available — never runs
+        unrooted ``rpm --eval`` against the host.
+        """
         chrootpath = None
         if hasattr(self.buildroot, "make_chroot_path"):
             chrootpath = self.buildroot.make_chroot_path()
         elif getattr(self.buildroot, "rootdir", None):
             chrootpath = self.buildroot.rootdir
 
-        cmd = ["rpm", "--eval", macro]
-        if chrootpath:
-            cmd = ["rpm", "--root", chrootpath, "--eval", macro]
+        if not chrootpath or not self.rpm_helper._usable_buildroot(chrootpath):
+            self.buildroot.root_log.debug(
+                "[SBOM] Skipping RPM macro %s without a buildroot", macro
+            )
+            return ""
+
+        cmd = ["rpm", "--root", chrootpath, "--eval", macro]
 
         if hasattr(self.buildroot, "doOutChroot"):
             try:
@@ -300,7 +304,8 @@ class SBOMGenerator:
                     return output.strip()
             except Exception as exc:  # pylint: disable=broad-except
                 self.buildroot.root_log.debug(
-                    f"Warning: failed to eval macro {macro} via doOutChroot: {exc}"
+                    "Warning: failed to eval macro %s via doOutChroot: %s",
+                    macro, exc,
                 )
         try:
             result = subprocess.run(
@@ -312,7 +317,9 @@ class SBOMGenerator:
             )
             return result.stdout.strip()
         except subprocess.CalledProcessError as exc:
-            self.buildroot.root_log.debug(f"Warning: failed to eval macro {macro}: {exc}")
+            self.buildroot.root_log.debug(
+                "Warning: failed to eval macro %s: %s", macro, exc
+            )
             return ""
 
     def _read_file_from_chroot(self, relative_path):
@@ -320,7 +327,10 @@ class SBOMGenerator:
         Read a file from inside the buildroot.
         Returns the file content as a string or empty string on failure.
         """
-        chroot_path = os.path.join(self.buildroot.rootdir, relative_path.lstrip("/"))
+        rootdir = getattr(self.buildroot, "rootdir", None)
+        if not rootdir:
+            return ""
+        chroot_path = os.path.join(rootdir, relative_path.lstrip("/"))
         try:
             with open(chroot_path, "r", encoding="utf-8", errors="ignore") as handle:
                 return handle.read().strip()
@@ -328,10 +338,26 @@ class SBOMGenerator:
             pass
         return ""
 
+    @staticmethod
+    def _flag_enabled(flag_tokens, positives, negatives):
+        """Return True if a positive flag token is present and no negative overrides it.
+
+        Negatives are checked first so substring traps like ``-fno-pie`` matching
+        ``-pie`` cannot claim a feature is enabled.
+        """
+        token_set = set(flag_tokens)
+        if any(neg in token_set for neg in negatives):
+            return False
+        return any(pos in token_set for pos in positives)
+
     def _collect_build_hardening_properties(self):
         """
         Capture key compiler/linker macro settings that influence hardening
         (FORTIFY, PIE, RELRO, LTO, etc.) and expose them as SBOM properties.
+
+        Feature/FIPS true/false bits are only emitted when at least one
+        corresponding evidence source was successfully read. Missing evidence
+        is omitted (unknown), not reported as false.
         """
         macro_queries = {
             "build:hardening:optflags": "%{?optflags}",
@@ -343,72 +369,81 @@ class SBOMGenerator:
 
         properties = []
         macro_values = {}
+        macro_evidence = False
         for prop_name, macro in macro_queries.items():
             value = self._evaluate_rpm_macro(macro)
             macro_values[prop_name] = value
             if value:
+                macro_evidence = True
                 properties.append({
                     "name": prop_name,
                     "value": value
                 })
 
-        cflags_combined = " ".join(
-            filter(
-                None,
-                [
-                    macro_values.get("build:hardening:optflags"),
-                    macro_values.get("build:hardening:hardening_cflags"),
-                    macro_values.get("build:hardening:global_cflags"),
-                ],
-            )
-        ).lower()
-        ldflags_combined = " ".join(
-            filter(
-                None,
-                [
-                    macro_values.get("build:hardening:global_ldflags"),
-                    macro_values.get("build:hardening:build_ldflags"),
-                ],
-            )
-        ).lower()
-        flag_union = f"{cflags_combined} {ldflags_combined}"
+        if macro_evidence:
+            cflags_combined = " ".join(
+                filter(
+                    None,
+                    [
+                        macro_values.get("build:hardening:optflags"),
+                        macro_values.get("build:hardening:hardening_cflags"),
+                        macro_values.get("build:hardening:global_cflags"),
+                    ],
+                )
+            ).lower()
+            ldflags_combined = " ".join(
+                filter(
+                    None,
+                    [
+                        macro_values.get("build:hardening:global_ldflags"),
+                        macro_values.get("build:hardening:build_ldflags"),
+                    ],
+                )
+            ).lower()
+            flag_union = f"{cflags_combined} {ldflags_combined}"
+            flag_tokens = flag_union.split()
 
-        def _contains_flag(flag):
-            return flag in flag_union if flag_union else False
-
-        feature_map = {
-            "build:hardening:fortify_enabled": any(
-                token in flag_union
-                for token in ["-d_fortify_source", "_fortify_source="]
-            ),
-            "build:hardening:pie_enabled": any(
-                token in flag_union for token in ["-fpie", "-pie"]
-            ),
-            "build:hardening:relro_enabled": any(
-                token in flag_union
-                for token in ["-z relro", "-z now", "-wl,-z,relro", "-wl,-z,now"]
-            ),
-            "build:hardening:lto_enabled": _contains_flag("-flto"),
-        }
-        for name, enabled in feature_map.items():
-            properties.append({
-                "name": name,
-                "value": "true" if enabled else "false"
-            })
+            feature_map = {
+                "build:hardening:fortify_enabled": any(
+                    token in flag_union
+                    for token in ["-d_fortify_source", "_fortify_source="]
+                ),
+                # Tokenize and check negatives first so "-fno-pie" is not
+                # mistaken for "-pie" via substring matching.
+                "build:hardening:pie_enabled": self._flag_enabled(
+                    flag_tokens,
+                    positives=("-fpie", "-pie"),
+                    negatives=("-fno-pie", "-nopie", "-no-pie"),
+                ),
+                "build:hardening:relro_enabled": any(
+                    token in flag_union
+                    for token in ["-z relro", "-z now", "-wl,-z,relro", "-wl,-z,now"]
+                ),
+                "build:hardening:lto_enabled": any(
+                    t == "-flto" or t.startswith("-flto=") for t in flag_tokens
+                ),
+            }
+            for name, enabled in feature_map.items():
+                properties.append({
+                    "name": name,
+                    "value": "true" if enabled else "false"
+                })
 
         fips_value = self._read_file_from_chroot("/proc/sys/crypto/fips_enabled")
-        if fips_value == "":
-            # Chroot /proc is often unmounted for standalone CLI; fall back to host.
-            try:
-                with open("/proc/sys/crypto/fips_enabled", "r", encoding="utf-8") as handle:
-                    fips_value = handle.read().strip()
-            except OSError:
-                fips_value = ""
-        # Always emit so auditors can require an explicit FIPS status bit.
-        properties.append({
-            "name": "build:hardening:fips_enabled",
-            "value": "true" if fips_value.strip() == "1" else "false",
-        })
+        # Only report chroot evidence. Host /proc is not buildroot hardening.
+        if fips_value != "":
+            properties.append({
+                "name": "build:hardening:fips_enabled",
+                "value": "true" if fips_value.strip() == "1" else "false",
+            })
+
+        # Collector status is based on macro evidence only (not FIPS/network).
+        if macro_evidence:
+            self._record_collector("hardening_macros", True)
+        else:
+            self._record_collector(
+                "hardening_macros", False, "no hardening macros collected"
+            )
 
         return properties
 
@@ -429,51 +464,100 @@ class SBOMGenerator:
                     elif entry.name.endswith('.rpm'):
                         rpm_files.append(entry.name)
         except OSError as e:
-            self.buildroot.root_log.debug(f"Failed to scan build directory {build_dir}: {e}")
+            self.buildroot.root_log.debug("Failed to scan build directory %s: %s", build_dir, e)
 
-        # Look for spec file in the chroot build directory
-        build_build_dir = os.path.join(self.buildroot.rootdir, "builddir/build")
-        if os.path.exists(build_build_dir):
-            try:
-                for root, _dirs, files in os.walk(build_build_dir):
-                    for file in files:
-                        if file.endswith('.spec'):
-                            spec_file = os.path.join(root, file)
+        # Look for spec file in the chroot build directory (skip when no root)
+        build_build_dir = self._chroot_build_dir()
+        if build_build_dir:
+            if os.path.exists(build_build_dir):
+                try:
+                    for root, _dirs, files in os.walk(build_build_dir):
+                        for file in files:
+                            if file.endswith('.spec'):
+                                spec_file = os.path.join(root, file)
+                                break
+                        if spec_file:
                             break
-                    if spec_file:
-                        break
-            except OSError as e:
-                self.buildroot.root_log.debug(
-                    f"Failed to scan chroot build dir {build_build_dir}: {e}"
-                )
+                except OSError as e:
+                    self.buildroot.root_log.debug("Failed to scan chroot build dir %s: %s", build_build_dir, e)
 
         return rpm_files, src_rpm_files, spec_file
 
-    def _find_originals_input_srpm(self):
-        """Locate and fingerprint the signed input SRPM under originals/ if present."""
+    def _chroot_build_dir(self):
+        """Host path to the chroot build dir, honoring ``chroothome``.
+
+        Uses ``buildroot.builddir`` (chroot-relative, derived from
+        ``config_opts['chroothome']``) via ``make_chroot_path`` when available,
+        falling back to the default ``builddir/build`` layout. Returns None
+        when no chroot root is configured.
+        """
         rootdir = getattr(self.buildroot, "rootdir", None)
         if not rootdir:
             return None
-        originals_dir = os.path.join(rootdir, "builddir/build/originals")
-        if not os.path.isdir(originals_dir):
-            return None
+        builddir = self.builddir or "/builddir/build"
+        make_path = getattr(self.buildroot, "make_chroot_path", None)
+        if callable(make_path):
+            path = make_path(builddir)
+            if path:
+                return path
+        return os.path.join(rootdir, builddir.lstrip("/"))
+
+    def _find_originals_input_srpm(self):
+        """Locate and fingerprint the signed input SRPM under originals/.
+
+        Returns:
+            tuple: ``(entry_or_None, status)`` where status is one of
+            ``found``, ``missing``, or ``error``.
+        """
+        build_dir = self._chroot_build_dir()
+        if not build_dir:
+            return None, "missing"
+        originals_dir = os.path.join(build_dir, "originals")
         try:
-            with os.scandir(originals_dir) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name.endswith(".src.rpm"):
-                        sig_info = self.rpm_helper.verify_rpm_signature(entry.path)
-                        return {
-                            "filename": entry.name,
-                            "sha256": self.rpm_helper.hash_file(entry.path),
-                            "digital_signature": sig_info,
-                            "source_type": "source_rpm",
-                            "role": "input",
-                        }
+            entry = self.rpm_helper.capture_originals_input_srpm(originals_dir)
         except OSError as exc:
             self.buildroot.root_log.debug(
                 "[SBOM] Could not read originals input SRPM: %s", exc
             )
-        return None
+            return None, "error"
+        if entry:
+            return entry, "found"
+        return None, "missing"
+
+    @staticmethod
+    def _downgrade_unverified_snapshot(srpm_entry):
+        """Copy a prebuild snapshot and strip unverifiable ``verified`` status.
+
+        Without a live ``rpm --checksig`` pass, a snapshot claiming
+        ``verified`` must be downgraded to ``present-unverified``.
+        """
+        if not srpm_entry:
+            return srpm_entry
+        entry = dict(srpm_entry)
+        sig = entry.get("digital_signature")
+        if not isinstance(sig, dict):
+            return entry
+        sig = dict(sig)
+        if sig.get("signature_status") == "verified" or sig.get("signature_valid"):
+            sig["signature_status"] = "present-unverified"
+            sig["signature_valid"] = False
+        entry["digital_signature"] = sig
+        return entry
+
+    @staticmethod
+    def _nevra_key(entry):
+        """Identity key shared by buildroot_lock and toolchain packages.
+
+        Lock entries have separate version/release; toolchain packages already
+        store version as ``V-R``.
+        """
+        return nevra_key(
+            entry.get("name"),
+            entry.get("version"),
+            release=entry.get("release"),
+            arch=entry.get("arch"),
+            epoch=entry.get("epoch"),
+        )
 
     def _record_input_srpm_entry(self, source_files, srpm_entry):
         """Insert or refresh the chain-of-custody input SRPM in source_files."""
@@ -483,9 +567,11 @@ class SBOMGenerator:
         existing = next(
             (
                 entry for entry in source_files
-                if entry.get("source_type") == "source_rpm"
-                or entry.get("filename") == srpm_name
-                or (entry.get("filename") or "").endswith(".src.rpm")
+                if entry.get("role") == "input"
+                or (
+                    srpm_name
+                    and entry.get("filename") == srpm_name
+                )
             ),
             None,
         )
@@ -508,9 +594,11 @@ class SBOMGenerator:
         Prebuild metadata is used only when it includes a non-empty package name;
         otherwise we re-parse the spec and/or recover from the SRPM.
 
-        Chain-of-custody for the input SRPM prefers the signed original under
-        ``builddir/build/originals/`` (captured at prebuild). The result-dir
-        ``*.src.rpm`` is a rebuilt output and is only used as a fallback.
+        Chain-of-custody for the input SRPM prefers a live ``rpm --checksig`` of
+        ``builddir/build/originals/*.src.rpm``. A prebuild JSON snapshot is used
+        only when the file is gone, and never keeps a ``verified`` status without
+        a checksig pass. The result-dir ``*.src.rpm`` is a rebuilt output and is
+        only used as a last fallback.
         """
         build_subject_name = None
         build_subject_version = None
@@ -541,10 +629,24 @@ class SBOMGenerator:
                 "spec/SRPM"
             )
 
-        # Prefer signed input SRPM (prebuild snapshot, else live originals/).
-        input_srpm = getattr(self, "prebuild_input_srpm", None) or None
-        if not input_srpm:
-            input_srpm = self._find_originals_input_srpm()
+        # Prefer live originals/ checksig; fall back to prebuild snapshot only
+        # when the file is confirmed missing (never on I/O error; never mint
+        # verified without checksig).
+        input_srpm, input_status = self._find_originals_input_srpm()
+        if input_status == "found":
+            self._record_collector("input_srpm", True)
+        elif input_status == "error":
+            self._record_collector(
+                "input_srpm", False, "failed reading originals/ input SRPM"
+            )
+            input_srpm = None
+        elif input_status == "missing":
+            snapshot = getattr(self, "prebuild_input_srpm", None) or None
+            if snapshot:
+                input_srpm = self._downgrade_unverified_snapshot(snapshot)
+                self._record_collector("input_srpm", True)
+            # Confirmed absence without snapshot is not a collector failure
+            # (spec-based builds often have no originals/ SRPM).
         if input_srpm:
             source_files = self._record_input_srpm_entry(source_files, input_srpm)
 
@@ -609,15 +711,21 @@ class SBOMGenerator:
     @traceLog()
     # pylint: disable=too-many-locals
     def generate(self):
-        """Generate the SBOM artifact(s) into the result directory."""
+        """Generate the SBOM artifact(s) into the result directory.
+
+        Returns:
+            bool: True when an SBOM file was successfully written; False on
+            skip-with-error or failure. Disabled/already-done returns True.
+        """
         self.buildroot.root_log.debug("[SBOM] Starting post-build SBOM generation")
         if self.sbom_done or not self.sbom_enabled:
-            return
+            return True
 
         state_text = f"Generating {self.sbom_type.upper()} SBOM for built packages"
         if self.state:
             self.state.start(state_text)
 
+        success = False
         try:
             build_dir = self.buildroot.resultdir
             rpm_files, src_rpm_files, spec_file = self._find_build_artifacts(build_dir)
@@ -627,7 +735,7 @@ class SBOMGenerator:
                     "No RPM, source RPM, or spec file found for SBOM generation."
                 )
                 self._record_collector("artifacts", False, "no build artifacts found")
-                return
+                return False
             self._record_collector("artifacts", True)
 
             (
@@ -649,7 +757,7 @@ class SBOMGenerator:
                 self.buildroot.root_log.warning(
                     "[SBOM] Cannot generate SBOM - build metadata incomplete"
                 )
-                return
+                return False
 
             distro_id = self.rpm_helper.detect_chroot_distribution() or "unknown"
             generate_cpe = self.conf.get("generate_cpe", False)
@@ -662,11 +770,10 @@ class SBOMGenerator:
                 if lock:
                     url_map = {}
                     for rpm_entry in (lock.get("buildroot") or {}).get("rpms") or []:
-                        key = f"{rpm_entry.get('name')}.{rpm_entry.get('arch')}"
                         if rpm_entry.get("url"):
-                            url_map[key] = rpm_entry["url"]
+                            url_map[self._nevra_key(rpm_entry)] = rpm_entry["url"]
                     for pkg in build_toolchain_packages:
-                        key = f"{pkg.get('name')}.{pkg.get('arch')}"
+                        key = self._nevra_key(pkg)
                         if key in url_map and not pkg.get("url"):
                             pkg["url"] = url_map[key]
 
@@ -701,7 +808,7 @@ class SBOMGenerator:
 
                 doc = self.spdx_gen.generate_spdx_document(
                     build_subject_name, build_subject_version, build_subject_release,
-                    build_dir, rpm_files, source_files,
+                    build_dir, rpm_files + src_rpm_files, source_files,
                     build_toolchain_packages, distro_id,
                     spec_metadata=spec_metadata, hardening_props=hardening_props
                 )
@@ -722,9 +829,7 @@ class SBOMGenerator:
                         ),
                     })
 
-                with open(out_file, "w", encoding="utf-8") as handle:
-                    json.dump(doc, handle, indent=2)
-
+                self._atomic_write_json(out_file, doc)
                 self.buildroot.root_log.info("SPDX SBOM written to: %s", out_file)
 
             else:
@@ -763,31 +868,61 @@ class SBOMGenerator:
                 )
                 self.cdx_gen.finalize_dependencies(
                     bom, source_component_entries,
-                    build_toolchain_packages, distro_id,
+                    build_toolchain_packages,
                     built_package_bom_refs, toolchain_bom_refs,
-                    spec_metadata=spec_metadata,
                     source_components=source_components,
                     toolchain_components=toolchain_components,
                     all_built_components=all_built_components
                 )
 
-                with open(out_file, "w", encoding="utf-8") as handle:
-                    json.dump(bom, handle, indent=2)
-
+                self._atomic_write_json(out_file, bom)
                 self.buildroot.root_log.info("CycloneDX SBOM written to: %s", out_file)
 
             if out_file and os.path.isfile(out_file):
                 self._write_sbom_digest(out_file)
+                success = True
+
+            return success
 
         except Exception as e:  # pylint: disable=broad-exception-caught
             self.buildroot.root_log.warning(
-                "[SBOM] FAILED during SBOM generation: %s", e
+                "[SBOM] FAILED during SBOM generation: %s", e, exc_info=True
             )
-            traceback.print_exc()
+            return False
         finally:
             self.sbom_done = True
             if self.state:
                 self.state.finish(state_text)
+
+    @staticmethod
+    def _atomic_write_text(path, text):
+        """Write text to ``path`` via a same-directory temp file + ``os.replace``.
+
+        On failure the destination is left unchanged (if it already existed).
+        """
+        directory = os.path.dirname(path) or "."
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+            dir=directory,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _atomic_write_json(path, payload):
+        """Serialize ``payload`` as JSON and publish atomically to ``path``."""
+        SBOMGenerator._atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
 
     def _write_sbom_digest(self, out_file):
         """Write SHA-256 sidecar digest next to the SBOM artifact."""
@@ -796,8 +931,10 @@ class SBOMGenerator:
             return
         digest_path = out_file + ".sha256"
         try:
-            with open(digest_path, "w", encoding="utf-8") as handle:
-                handle.write(f"{digest}  {os.path.basename(out_file)}\n")
+            self._atomic_write_text(
+                digest_path,
+                f"{digest}  {os.path.basename(out_file)}\n",
+            )
             self.buildroot.root_log.info("SBOM digest written to: %s", digest_path)
         except OSError as exc:
             self.buildroot.root_log.warning("Failed to write SBOM digest: %s", exc)

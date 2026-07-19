@@ -3,7 +3,7 @@ layout: default
 title: Plugin SBOM Generator
 ---
 
-This plugin generates a Software Bill of Materials (SBOM) in CycloneDX format for packages built with Mock. The SBOM provides detailed information about the build environment, source files, and resulting packages, optimized for security use cases.
+This plugin generates a Software Bill of Materials (SBOM) in CycloneDX and SPDX formats for packages built with Mock. The SBOM provides detailed information about the build environment, source files, and resulting packages, optimized for security use cases.
 
 ## Features
 
@@ -14,8 +14,10 @@ This plugin generates a Software Bill of Materials (SBOM) in CycloneDX format fo
   * Correctly handles path mapping between chroot and host environments.
 * Captures detailed information about:
   * Source files and patches from spec files with a resilient regex-based fallback for legacy/strict syntax errors.
-  * Binary RPM metadata with standard PURL and CPE identifiers.
-  * Complete build toolchain packages with per-package GPG signature metadata.
+  * Binary RPM metadata with standard PURL identifiers, and CPE identifiers
+    when ``generate_cpe`` is enabled.
+  * Build toolchain packages with per-package GPG signature metadata when
+    available (best-effort; see ``sbom:completeness`` and collection errors).
   * Runtime dependencies.
   * File hashes (SHA-256).
 * Optimized Performance: Consolidated file listing and metadata extraction into a single pass.
@@ -43,7 +45,10 @@ mock --enable-plugin=sbom_generator --rebuild ~/rpmbuild/SRPMS/package-1.0-1.fc4
 mock --enable-plugin=sbom_generator --rebuild package.src.rpm -r rocky-9-x86_64
 ```
 
-After the build completes, the SBOM will be available in the build results directory
+After the build completes, the SBOM is written to the results directory as
+`<name>-<version>-<release>.sbom` (CycloneDX) or
+`<name>-<version>-<release>.spdx.json` (SPDX). Examples below use
+`package-1.0-1.fc42.sbom` to match the sample rebuild above.
 
 ### Viewing and Analyzing the SBOM
 
@@ -51,18 +56,21 @@ The generated SBOM can be analyzed using various tools:
 
 ```bash
 # View basic SBOM information
-jq '.metadata.component' sbom.cyclonedx.json
-jq '.components | length' sbom.cyclonedx.json
-jq '.dependencies | length' sbom.cyclonedx.json
+jq '.metadata.component' package-1.0-1.fc42.sbom
+jq '.components | length' package-1.0-1.fc42.sbom
+jq '.dependencies | length' package-1.0-1.fc42.sbom
 
-# List all built packages
-jq '.components[] | select(.type == "library") | {name, version, purl}' sbom.cyclonedx.json
+# List all built packages (exclude build-toolchain role)
+jq '.components[]
+  | select(.type == "library" or .type == "application")
+  | select(any(.properties[]?; .name == "mock:role" and .value == "build-toolchain") | not)
+  | {name, version, purl}' package-1.0-1.fc42.sbom
 
 # List source files used in the build
-jq '.components[] | select(.properties[]?.name == "mock:source:type") | {name, hashes}' sbom.cyclonedx.json
+jq '.components[] | select(.properties[]?.name == "mock:source:type") | {name, hashes}' package-1.0-1.fc42.sbom
 
 # View runtime dependencies for a specific package
-jq '.dependencies[] | select(.ref | contains("httpd"))' sbom.cyclonedx.json
+jq '.dependencies[] | select(.ref | contains("httpd"))' package-1.0-1.fc42.sbom
 ```
 
 ### Using with Security Scanners
@@ -70,18 +78,19 @@ jq '.dependencies[] | select(.ref | contains("httpd"))' sbom.cyclonedx.json
 The SBOM can be directly used with security vulnerability scanners:
 
 ```bash
-
 # Scan with SBOM Auditor
-sbom-auditor sbom.cyclonedx.json
+sbom-auditor package-1.0-1.fc42.sbom
 
 # Scan with Grype
-grype sbom:./sbom.cyclonedx.json
+grype sbom:./package-1.0-1.fc42.sbom
 
 # Scan with Trivy
-trivy sbom sbom.cyclonedx.json
+trivy sbom package-1.0-1.fc42.sbom
 
-# Export to other formats if needed
-syft convert sbom.cyclonedx.json -o spdx-json > sbom.spdx.json
+# Native SPDX via mock-sbom-generator (writes <n>-<v>-<r>.spdx.json in resultdir)
+mock-sbom-generator --type spdx --resultdir . --root /var/lib/mock/ROOT/root
+# Or generate SPDX JSON from the built package with Syft:
+syft package-1.0-1.fc42.x86_64.rpm -o spdx-json > package-1.0-1.fc42.spdx.json
 ```
 
 ## Configuration
@@ -123,11 +132,13 @@ config_opts['plugin_conf']['sbom_generator_opts'] = {
     'generate_sbom': True,              # Enable SBOM generation (default: True)
     'type': 'cyclonedx',                # 'cyclonedx' or 'spdx'
     'command': '/usr/bin/mock-sbom-generator',  # Standalone generator executable
+    'generate_cpe': False,              # Heuristic CPE (default: False)
     'include_file_components': True,    # Include file-level components (default: True)
     'include_file_dependencies': False, # Include file-to-package dependencies (default: False)
     'include_debug_files': False,       # Include debug files in file components (default: False)
     'include_man_pages': True,          # Include man pages in file components (default: True)
-    'include_toolchain_dependencies': False,  # Include build toolchain in dependencies (default: False)
+    'include_source_dependencies': True,  # Primary dependsOn includes build inputs (default: True)
+    'include_toolchain_dependencies': False,  # Primary/package dependsOn includes toolchain (default: False)
 }
 ```
 
@@ -139,6 +150,10 @@ mock-sbom-generator --type cyclonedx \
     --root /var/lib/mock/fedora-rawhide-x86_64/root
 ```
 
+Pass `--root` for toolchain/distribution collectors. Omitting it skips those
+collectors; `--root /` is rejected so host RPMs are never recorded as the
+toolchain.
+
 **Configuration Options Explained:**
 
 - `type`: SBOM format (`cyclonedx` or `spdx`).
@@ -148,9 +163,16 @@ mock-sbom-generator --type cyclonedx \
   vulnerability matches from fabricated CPEs).
 - `include_file_components`: When enabled, creates individual file components for each file in built packages, including hashes, permissions, and ownership information.
 - `include_file_dependencies`: Creates dependency relationships showing which files belong to which packages.
-- `include_debug_files`: Filters out debug files (`.debug`, files in `/usr/lib/debug`) from file components.
-- `include_man_pages`: Filters out man pages from file components.
-- `include_toolchain_dependencies`: Adds build toolchain packages to the dependencies array (useful for complete build provenance, but can make dependency graphs very large).
+- `include_debug_files`: When `False` (default), debug files (`.debug`, paths under
+  `/usr/lib/debug`) are omitted from file components; set `True` to include them.
+- `include_man_pages`: When `False`, man/info pages are omitted from file
+  components; when `True` (default), they are included.
+- `include_source_dependencies`: When `True` (default), the primary component's
+  `dependsOn` list includes build-input source/patch bom-refs. Set `False` to
+  keep sources only in `components[]` / formulation inputs.
+- `include_toolchain_dependencies`: When `True`, adds build toolchain bom-refs to
+  package/`dependsOn` graphs (useful for complete build provenance, but can make
+  dependency graphs very large). Default `False`.
 
 ## Output
 
@@ -171,11 +193,12 @@ The plugin generates a file named `<name>-<version>-<release>.sbom` (for Cyclone
     (never claims valid without cryptographic check)
   * Host forensics: kernel, SELinux mode, host distribution
   * Sidecar digest: `<sbom>.sha256`
-  * RPM header metadata surfaced at the document level (buildhost, buildtime, source RPM, group, epoch, distribution, manufacture/vendor)
+  * RPM header metadata surfaced at the document level (buildhost, buildtime, group, epoch, distribution)
+  * Component manufacturer from RPM Vendor (not BOM author); packager as supplier when present
 * Components array containing:
   * Built packages (type: "library" or "application")
     * Package name, version, and PURL
-    * CPE identifiers for vulnerability matching
+    * CPE identifiers for vulnerability matching (only when `generate_cpe` is enabled)
     * License information plus RPM summary as description
     * RPM file SHA-256 hash
     * Vendor, packager, buildhost, buildtime, source RPM, group, epoch, distribution metadata
@@ -193,7 +216,11 @@ The plugin generates a file named `<name>-<version>-<release>.sbom` (for Cyclone
 * Dependencies array
   * Runtime dependencies for built packages (libraries/RPMs the package depends on)
   * Dependency relationships modeled using bom-refs
-  * Note: Source code relationships are represented in component properties and the components array, not in the dependencies section (source code is a build input, not a runtime dependency)
+  * With default `include_source_dependencies=True`, the primary component also
+    `dependsOn` build-input source/patch bom-refs. Set that option `False` to
+    keep sources only in `components[]` / formulation.
+  * Toolchain bom-refs are added to `dependsOn` only when
+    `include_toolchain_dependencies=True` (default `False`)
 
 ### Interpreting auditor WARN findings
 
@@ -210,11 +237,15 @@ When auditing with `sbom-auditor`, some WARN results are expected depending on b
   packages from the chroot must report `verified` (or `present-unverified` if
   the keyring cannot confirm the key). An all-unsigned toolchain is a generator
   failure.
-* **Hardening `pie_enabled=false` / `fips_enabled=false`** — Flags are always
-  recorded; a false value is reported but does not by itself fail the audit when
-  the property is present.
+* **Hardening `pie_enabled` / `fips_enabled`** — Emitted as `true`/`false` only
+  when macros or the FIPS sysctl were successfully read. Missing evidence is
+  omitted (unknown), not reported as `false`.
 
 ## Example SBOM Structure
+
+Abbreviated CycloneDX example (runtime edges only). With the default
+``include_source_dependencies=True``, the primary component's ``dependsOn``
+also includes source/patch bom-refs omitted here for brevity.
 
 ```json
 {
@@ -237,24 +268,21 @@ When auditing with `sbom-auditor`, some WARN results are expected depending on b
       { "name": "mock:build:chroot", "value": "/var/lib/mock/fedora-42-x86_64/root" },
       { "name": "mock:rpm:buildhost", "value": "builder.fedora.example.org" },
       { "name": "mock:rpm:buildtime", "value": "2024-01-19T15:15:00+00:00" },
-      { "name": "mock:rpm:sourcerpm", "value": "package-name-1.0-1.fc42.src.rpm" },
       { "name": "mock:rpm:group", "value": "System Environment/Libraries" },
       { "name": "mock:rpm:epoch", "value": "1" }
     ],
-    "manufacture": {
-      "name": "Fedora Project"
-    },
     "component": {
       "type": "application",
       "name": "package-name",
       "version": "1.0-1.fc42",
       "bom-ref": "build-output:package-name",
       "description": "Package summary (build output containing 3 package(s))",
+      "manufacturer": {
+        "name": "Fedora Project"
+      },
       "licenses": [
         {
-          "license": {
-            "id": "MIT"
-          }
+          "expression": "MIT"
         }
       ],
       "externalReferences": [
@@ -273,7 +301,7 @@ When auditing with `sbom-auditor`, some WARN results are expected depending on b
       "externalReferences": [
         {
           "type": "other",
-          "comment": "CPE 2.3",
+          "comment": "CPE 2.3 (heuristic)",
           "url": "cpe:2.3:a:fedora:package-name:1.0:*:*:*:*:*:*:*:*"
         },
         {
@@ -287,9 +315,7 @@ When auditing with `sbom-auditor`, some WARN results are expected depending on b
       ],
       "licenses": [
         {
-          "license": {
-            "id": "MIT"
-          }
+          "expression": "MIT"
         }
       ],
       "hashes": [
@@ -312,19 +338,19 @@ When auditing with `sbom-auditor`, some WARN results are expected depending on b
           "value": "2024-01-19T15:15:00+00:00"
         },
         {
-          "name": "mock:rpm:sourcerpm",
-          "value": "package-name-1.0-1.fc42.src.rpm"
-        },
-        {
           "name": "mock:signature:type",
           "value": "GPG"
+        },
+        {
+          "name": "mock:signature:status",
+          "value": "verified"
         }
       ]
     }
   ],
   "dependencies": [
     {
-      "ref": "pkg:rpm/fedora/package-name@1.0-1.fc42",
+      "ref": "pkg:rpm/fedora/package-name@1.0-1.fc42?arch=x86_64",
       "dependsOn": [
         "pkg:rpm/fedora/glibc@2.38-1.fc42"
       ]
@@ -337,11 +363,12 @@ When auditing with `sbom-auditor`, some WARN results are expected depending on b
 
 The generated CycloneDX SBOM is compatible with popular security scanners:
 
-* **Grype**: `grype sbom:./sbom.cyclonedx.json`
-* **Trivy**: `trivy sbom sbom.cyclonedx.json`
+* **Grype**: `grype sbom:./package-1.0-1.fc42.sbom`
+* **Trivy**: `trivy sbom package-1.0-1.fc42.sbom`
 * **Snyk**: Supports CycloneDX format for vulnerability scanning
 
-The SBOM includes PURL (Package URL) and CPE identifiers for accurate vulnerability matching.
+The SBOM includes PURL (Package URL) identifiers for accurate package identity.
+CPE identifiers are included only when `generate_cpe` is enabled.
 
 ## Requirements
 
@@ -351,9 +378,16 @@ The SBOM includes PURL (Package URL) and CPE identifiers for accurate vulnerabil
 
 ## Notes
 
-* The plugin runs in the `postbuild` hook, after the build completes.
+* The plugin captures ``sbom-prebuild.json`` in a prebuild hook (sources/spec
+  snapshot), then generates the SBOM in the ``postbuild`` hook after the build
+  completes.
 * SBOM generation is skipped if no RPM, source RPM, or spec file is found.
-* **Hybrid Analysis**: Uses `doChroot` to analyze artifacts within the buildroot (ensuring compatibility with target RPM versions) and host tools for artifacts already exported to the `result/` directory.
+* **Best-effort postbuild**: if SBOM generation fails, Mock logs a warning and
+  the package build still succeeds. The standalone `mock-sbom-generator` CLI
+  exits non-zero on failure.
+* **Hybrid Analysis**: Uses host/bootstrap `doOutChroot` (typically
+  `rpm --root` against the target chroot) for chroot queries, and host tools
+  for artifacts already exported to the `result/` directory.
 * **Resilient Parsing**: Includes a regex-based fallback for spec files that fail strict parsing by the `specfile` library (e.g., legacy `%patchN` syntax).
 * **PURL format**: `pkg:rpm/{distro}/{package}@{version}?arch={arch}`. Architecture is always separated into a qualifier, never baked into the version string.
 * Mock-specific metadata is stored in properties with the `mock:` prefix.
@@ -362,9 +396,13 @@ The SBOM includes PURL (Package URL) and CPE identifiers for accurate vulnerabil
 
 This SBOM generator leverages Mock's unique build environment visibility:
 
-* **Complete Build Toolchain**: Captures every package installed in the build chroot, not just declared dependencies
-* **Build-Time Provenance**: Records the exact build environment, including tool versions and signatures
+* **Build Toolchain Visibility**: Captures installed chroot packages when
+  collectors succeed (not only declared BuildRequires); coverage is reported via
+  ``sbom:completeness``
+* **Build-Time Provenance**: Records build-environment metadata, including tool
+  versions and signature status when available
 * **RPM-Native Intelligence**: Deep integration with RPM metadata, spec files, and package signatures
-* **Reproducible Build Context**: Complete build environment fingerprinting for reproducibility verification
+* **Reproducible Build Context**: Build-environment fingerprinting to support
+  reproducibility verification
 
 Available since version 6.7. 

@@ -54,33 +54,22 @@ class SBOMGeneratorPlugin:
             self.buildroot.resultdir, PREBUILD_STATE_FILENAME
         )
 
-        plugins.add_hook("prebuild", self._capture_prebuild_state)
-        plugins.add_hook("postbuild", self._run_sbom_generator)
+        if self.sbom_enabled:
+            plugins.add_hook("prebuild", self._capture_prebuild_state)
+            plugins.add_hook("postbuild", self._run_sbom_generator)
 
     def _capture_input_srpm(self):
         """Record the original (signed) input SRPM from Mock's originals/ tree.
 
         The result-dir ``*.src.rpm`` is a rebuilt, typically unsigned artifact.
         Chain-of-custody checks must use the pristine input under
-        ``builddir/build/originals/``.
+        ``<builddir>/originals/`` (honoring ``config_opts['chroothome']``).
         """
-        originals_dir = os.path.join(
-            self.buildroot.rootdir, "builddir/build/originals"
+        originals_dir = self.buildroot.make_chroot_path(
+            self.buildroot.builddir, "originals"
         )
-        if not os.path.isdir(originals_dir):
-            return None
         try:
-            with os.scandir(originals_dir) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name.endswith(".src.rpm"):
-                        sig_info = self.rpm_helper.verify_rpm_signature(entry.path)
-                        return {
-                            "filename": entry.name,
-                            "sha256": self.rpm_helper.hash_file(entry.path),
-                            "digital_signature": sig_info,
-                            "source_type": "source_rpm",
-                            "role": "input",
-                        }
+            return self.rpm_helper.capture_originals_input_srpm(originals_dir)
         except OSError as exc:
             self.buildroot.root_log.warning(
                 "[SBOM] Failed scanning originals for input SRPM: %s", exc
@@ -89,9 +78,13 @@ class SBOMGeneratorPlugin:
 
     @traceLog()
     def _capture_prebuild_state(self):
-        """Captures pristine source artifacts before the build begins."""
+        """Captures pristine source artifacts before the build begins.
+
+        Runs under ``uid_manager`` (mockbuild) and refuses to follow symlinks
+        that escape the chroot when hashing SPECS/SOURCES/originals.
+        """
         self.buildroot.root_log.debug("Capturing pre-build state from SPECS and SOURCES")
-        specs_dir = os.path.join(self.buildroot.rootdir, "builddir/build/SPECS")
+        specs_dir = self.buildroot.make_chroot_path(self.buildroot.builddir, "SPECS")
         state = {
             "spec_metadata": {},
             "source_files": [],
@@ -100,52 +93,108 @@ class SBOMGeneratorPlugin:
             "capture_errors": [],
         }
         try:
-            if os.path.exists(specs_dir):
-                with os.scandir(specs_dir) as entries:
-                    for entry in entries:
-                        if entry.name.endswith(".spec") and entry.is_file():
-                            self.buildroot.root_log.debug(
-                                "Parsing spec file for pre-build state: %s", entry.path
-                            )
-                            metadata, sources = self.rpm_helper.parse_spec_file(entry.path)
-                            state["spec_metadata"] = metadata
-                            state["source_files"] = sources
-                            if not (metadata or {}).get("name"):
-                                msg = f"spec parse produced empty name for {entry.path}"
-                                state["capture_errors"].append(msg)
-                                self.buildroot.root_log.warning("[SBOM] %s", msg)
-                            break
-            else:
-                msg = "SPECS directory does not exist for pre-build capture"
-                state["capture_errors"].append(msg)
-                self.buildroot.root_log.warning("[SBOM] %s", msg)
-
-            input_srpm = self._capture_input_srpm()
-            if input_srpm:
-                state["input_srpm"] = input_srpm
-                sources = list(state.get("source_files") or [])
-                if not any(
-                    e.get("source_type") == "source_rpm"
-                    or (e.get("filename") or "").endswith(".src.rpm")
-                    for e in sources
-                ):
-                    sources.insert(0, input_srpm)
-                    state["source_files"] = sources
-                self.buildroot.root_log.debug(
-                    "[SBOM] Captured input SRPM %s (%s)",
-                    input_srpm.get("filename"),
-                    (input_srpm.get("digital_signature") or {}).get(
-                        "signature_status", "unknown"
-                    ),
+            with self.buildroot.uid_manager:
+                specs_safe = (
+                    bool(specs_dir)
+                    and os.path.exists(specs_dir)
+                    and self.rpm_helper.path_stays_in_chroot(specs_dir)
                 )
-            else:
-                msg = "No input SRPM found under builddir/build/originals"
-                state["capture_errors"].append(msg)
-                self.buildroot.root_log.warning("[SBOM] %s", msg)
+                if specs_dir and os.path.exists(specs_dir) and not specs_safe:
+                    msg = "SPECS directory resolves outside the build chroot"
+                    state["capture_errors"].append(msg)
+                    self.buildroot.root_log.warning("[SBOM] %s", msg)
+                elif specs_safe:
+                    try:
+                        with os.scandir(specs_dir) as entries:
+                            for entry in entries:
+                                if entry.is_symlink():
+                                    self.buildroot.root_log.warning(
+                                        "[SBOM] Skipping symlink in SPECS: %s",
+                                        entry.path,
+                                    )
+                                    continue
+                                if entry.name.endswith(".spec") and entry.is_file(
+                                    follow_symlinks=False
+                                ):
+                                    self.buildroot.root_log.debug(
+                                        "Parsing spec file for pre-build state: %s",
+                                        entry.path,
+                                    )
+                                    try:
+                                        metadata, sources = (
+                                            self.rpm_helper.parse_spec_file(
+                                                entry.path
+                                            )
+                                        )
+                                        state["spec_metadata"] = metadata
+                                        state["source_files"] = sources
+                                        if not (metadata or {}).get("name"):
+                                            msg = (
+                                                "spec parse produced empty name "
+                                                f"for {entry.path}"
+                                            )
+                                            state["capture_errors"].append(msg)
+                                            self.buildroot.root_log.warning(
+                                                "[SBOM] %s", msg
+                                            )
+                                    except Exception as exc:  # pylint: disable=broad-exception-caught
+                                        msg = (
+                                            f"Failed parsing spec {entry.path}: {exc}"
+                                        )
+                                        state["capture_errors"].append(msg)
+                                        self.buildroot.root_log.warning(
+                                            "[SBOM] %s", msg
+                                        )
+                                    break
+                    except OSError as exc:
+                        msg = f"Failed scanning SPECS directory: {exc}"
+                        state["capture_errors"].append(msg)
+                        self.buildroot.root_log.warning("[SBOM] %s", msg)
+                else:
+                    msg = "SPECS directory does not exist for pre-build capture"
+                    state["capture_errors"].append(msg)
+                    self.buildroot.root_log.warning("[SBOM] %s", msg)
 
-            os.makedirs(self.buildroot.resultdir, exist_ok=True)
-            with open(self.prebuild_state_path, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, indent=2)
+                # Always attempt input-SRPM capture even if spec parsing failed.
+                input_srpm = self._capture_input_srpm()
+                if input_srpm:
+                    state["input_srpm"] = input_srpm
+                    sources = list(state.get("source_files") or [])
+                    if not any(
+                        e.get("source_type") == "source_rpm"
+                        or (
+                            e.get("role") == "input"
+                            and (e.get("filename") or "").endswith(".src.rpm")
+                        )
+                        for e in sources
+                    ):
+                        sources.insert(0, input_srpm)
+                        state["source_files"] = sources
+                    self.buildroot.root_log.debug(
+                        "[SBOM] Captured input SRPM %s (%s)",
+                        input_srpm.get("filename"),
+                        (input_srpm.get("digital_signature") or {}).get(
+                            "signature_status", "unknown"
+                        ),
+                    )
+                else:
+                    # Spec-file builds often have no originals/ SRPM; only treat
+                    # that as a capture gap when we also lack usable spec metadata.
+                    if not (state.get("spec_metadata") or {}).get("name"):
+                        msg = (
+                            "No input SRPM found under the chroot originals/ directory"
+                        )
+                        state["capture_errors"].append(msg)
+                        self.buildroot.root_log.warning("[SBOM] %s", msg)
+                    else:
+                        self.buildroot.root_log.debug(
+                            "[SBOM] No input SRPM under originals/ "
+                            "(spec-based build; skipping capture error)"
+                        )
+
+                os.makedirs(self.buildroot.resultdir, exist_ok=True)
+                with open(self.prebuild_state_path, "w", encoding="utf-8") as handle:
+                    json.dump(state, handle, indent=2)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             self.buildroot.root_log.warning(
                 "Failed to capture pre-build state: %s", exc
@@ -199,19 +248,22 @@ class SBOMGeneratorPlugin:
             "online": bool(config.get("online", True)),
             "rpmbuild_networking": bool(config.get("rpmbuild_networking", False)),
         }
-        # Effective isolation: explicit value, else infer from use_nspawn
         isolation = config.get("isolation")
         use_nspawn = config.get("use_nspawn")
-        if isolation is None:
-            if use_nspawn is True:
-                isolation = "nspawn"
-            elif use_nspawn is False:
-                isolation = "simple"
-            else:
-                isolation = "nspawn"  # mock default historically
+
+        # Keep isolation and use_nspawn consistent. Explicit isolation wins;
+        # only None/auto derive from Mock's resolved runtime backend.
+        if isolation == "simple":
+            use_nspawn = False
+        elif isolation == "nspawn":
+            use_nspawn = True
+        else:
+            # isolation is None or "auto"
+            if use_nspawn is None:
+                use_nspawn = bool(mockbuild.util.USE_NSPAWN)
+            isolation = "nspawn" if use_nspawn else "simple"
+
         env["isolation"] = str(isolation)
-        if use_nspawn is None:
-            use_nspawn = str(isolation) == "nspawn"
         env["use_nspawn"] = bool(use_nspawn)
         return env
 
@@ -255,6 +307,8 @@ class SBOMGeneratorPlugin:
                 self.buildroot.resultdir,
                 "--root",
                 self.buildroot.make_chroot_path(),
+                "--builddir",
+                self.buildroot.builddir,
             ]
             prebuild = self._prebuild_json_path()
             if prebuild:
@@ -289,6 +343,7 @@ class SBOMGeneratorPlugin:
             with self.buildroot.uid_manager:
                 mockbuild.util.do(cmd, shell=False)
         except Exception as exc:  # pylint: disable=broad-exception-caught
+            # Best-effort forensic step: never fail the Mock build over SBOM.
             self.buildroot.root_log.warning("SBOM generation failed: %s", exc)
         finally:
             self.sbom_done = True

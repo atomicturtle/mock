@@ -1,4 +1,4 @@
-#! /usr/bin/python3
+#!/usr/bin/python3 -tt
 # -*- coding: utf-8 -*-
 # vim:expandtab:autoindent:tabstop=4:shiftwidth=4:filetype=python:textwidth=0:
 # License: GPL2 or later see COPYING
@@ -44,10 +44,17 @@ class StandaloneContext:
     """Minimal buildroot duck-type for standalone SBOM generation."""
 
     def __init__(self, rootdir, resultdir, mock_version=None, mock_config=None,
-                 online=True, rpmbuild_networking=False, isolation=None, use_nspawn=None):
-        self.rootdir = os.path.abspath(rootdir)
+                 online=True, rpmbuild_networking=False, isolation=None,
+                 use_nspawn=None, builddir=None):
+        # None means "no chroot" — never treat the host "/" as the buildroot.
+        self.rootdir = os.path.abspath(rootdir) if rootdir else None
         self.resultdir = os.path.abspath(resultdir)
-        self.builddir = os.path.join(self.rootdir, "builddir")
+        # Chroot-relative build dir, matching Buildroot.builddir semantics
+        # (chroothome + "/build").
+        if self.rootdir:
+            self.builddir = builddir or "/builddir/build"
+        else:
+            self.builddir = None
         self.root_log = _SimpleLog()
         self.state = None
         self.config = {
@@ -62,24 +69,30 @@ class StandaloneContext:
             self.config["use_nspawn"] = use_nspawn
 
     def make_chroot_path(self, *paths):
-        new_path = self.rootdir
+        """Join paths under rootdir; reject escapes via ``..`` or symlinks."""
+        if not self.rootdir:
+            return None
+        root = os.path.realpath(self.rootdir)
+        new_path = root
         for path in paths:
-            if path.startswith("/"):
-                path = path[1:]
-            new_path = os.path.join(new_path, path)
+            relative = os.path.normpath(os.fspath(path).lstrip("/"))
+            if relative in (".", ""):
+                continue
+            if relative == ".." or relative.startswith(".." + os.sep):
+                raise ValueError(f"path escapes buildroot: {path!r}")
+            new_path = os.path.realpath(os.path.join(new_path, relative))
+            if os.path.commonpath((root, new_path)) != root:
+                raise ValueError(f"path escapes buildroot: {path!r}")
         return new_path
 
     def from_chroot_path(self, host_path):
-        if host_path.startswith(self.rootdir):
-            rel_path = host_path[len(self.rootdir):]
-            if not rel_path.startswith("/"):
-                rel_path = "/" + rel_path
-            return rel_path
-        return host_path
+        from mockbuild.util import host_path_to_chroot_path
+        return host_path_to_chroot_path(host_path, self.rootdir)
 
     def doOutChroot(self, command, *args, **kwargs):  # pylint: disable=invalid-name,unused-argument
         """Execute command on the host (standalone has no bootstrap chroot)."""
         shell = kwargs.pop("shell", False)
+        return_stderr = kwargs.pop("returnStderr", False)
         env = os.environ.copy()
         env["LC_ALL"] = "C"
         result = subprocess.run(
@@ -91,13 +104,30 @@ class StandaloneContext:
             text=True,
             env=env,
         )
-        return result.stdout, result.returncode
+        output = result.stdout or ""
+        # rpm --checksig diagnostics (NOKEY, NOT OK) often land on stderr;
+        # merge them like Buildroot.doOutChroot does with returnStderr=True.
+        if return_stderr and result.stderr:
+            output = (output + "\n" + result.stderr) if output else result.stderr
+        return output, result.returncode
 
 
 def _parse_bool(value):
+    """Parse an explicit boolean CLI/config value.
+
+    Raises:
+        ValueError: If ``value`` is not a recognized true/false spelling.
+    """
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        f"invalid boolean value: {value!r} (expected true/false/yes/no/1/0)"
+    )
 
 
 def _argparser():
@@ -118,8 +148,20 @@ def _argparser():
     )
     parser.add_argument(
         "--root",
-        default="/",
-        help="Path to the build chroot root (for toolchain/macro queries)",
+        default=None,
+        help=(
+            "Path to the Mock build chroot root (required for toolchain, "
+            "distribution, and chroot RPM/macro queries). Omit to skip those "
+            "collectors; never defaults to the host filesystem root."
+        ),
+    )
+    parser.add_argument(
+        "--builddir",
+        default=None,
+        help=(
+            "Chroot-relative build directory (Buildroot.builddir / "
+            "chroothome+/build). Default: /builddir/build"
+        ),
     )
     parser.add_argument(
         "--prebuild-json",
@@ -174,51 +216,104 @@ def main(argv=None):
         log.error("Result directory does not exist: %s", args.resultdir)
         return 1
 
+    rootdir = args.root
+    if rootdir is not None:
+        rootdir = os.path.abspath(rootdir)
+        if not os.path.isdir(rootdir):
+            log.error("Buildroot does not exist: %s", rootdir)
+            return 1
+        if os.path.realpath(rootdir) == "/":
+            log.error(
+                "--root must be a Mock build chroot, not the host filesystem root (/)"
+            )
+            return 1
+    else:
+        log.warning(
+            "No --root given; skipping chroot toolchain/distribution collectors"
+        )
+
     prebuild_source_files = []
     prebuild_spec_metadata = {}
     prebuild_capture_errors = []
     prebuild_input_srpm = None
     build_env = {}
-    if args.prebuild_json and os.path.isfile(args.prebuild_json):
-        with open(args.prebuild_json, "r", encoding="utf-8") as handle:
-            state = json.load(handle)
+    if args.prebuild_json:
+        try:
+            with open(args.prebuild_json, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            log.error("Cannot load prebuild JSON %s: %s", args.prebuild_json, exc)
+            return 1
+        if not isinstance(state, dict):
+            log.error(
+                "Prebuild JSON must contain an object: %s", args.prebuild_json
+            )
+            return 1
+        for key, expect_type, label in (
+            ("source_files", list, "list"),
+            ("spec_metadata", dict, "object"),
+            ("capture_errors", list, "list"),
+            ("build_env", dict, "object"),
+        ):
+            if key not in state or state.get(key) is None:
+                continue
+            if not isinstance(state.get(key), expect_type):
+                log.error(
+                    "Prebuild JSON field %r must be a %s: %s",
+                    key, label, args.prebuild_json,
+                )
+                return 1
         prebuild_source_files = state.get("source_files") or []
         prebuild_spec_metadata = state.get("spec_metadata") or {}
         prebuild_capture_errors = state.get("capture_errors") or []
         prebuild_input_srpm = state.get("input_srpm")
         build_env = state.get("build_env") or {}
 
+    def _cli_bool(raw, flag_name):
+        try:
+            return _parse_bool(raw)
+        except ValueError as exc:
+            log.error("%s: %s", flag_name, exc)
+            raise SystemExit(1) from exc
+
     # CLI flags override values captured in prebuild JSON when provided.
     online = (
-        _parse_bool(args.online) if args.online is not None
+        _cli_bool(args.online, "--online") if args.online is not None
         else build_env.get("online", True)
     )
     rpmbuild_networking = (
-        _parse_bool(args.rpmbuild_networking) if args.rpmbuild_networking is not None
+        _cli_bool(args.rpmbuild_networking, "--rpmbuild-networking")
+        if args.rpmbuild_networking is not None
         else build_env.get("rpmbuild_networking", False)
     )
     isolation = args.isolation if args.isolation is not None else build_env.get("isolation")
     if args.use_nspawn is not None:
-        use_nspawn = _parse_bool(args.use_nspawn)
+        use_nspawn = _cli_bool(args.use_nspawn, "--use-nspawn")
     elif "use_nspawn" in build_env:
         use_nspawn = build_env.get("use_nspawn")
     else:
         use_nspawn = None
 
-    conf = {
-        "generate_sbom": True,
-        "type": args.type,
-        "include_file_components": _parse_bool(args.include_file_components),
-        "include_file_dependencies": _parse_bool(args.include_file_dependencies),
-        "include_debug_files": _parse_bool(args.include_debug_files),
-        "include_man_pages": _parse_bool(args.include_man_pages),
-        "include_source_dependencies": _parse_bool(args.include_source_dependencies),
-        "include_toolchain_dependencies": _parse_bool(args.include_toolchain_dependencies),
-        "generate_cpe": _parse_bool(args.generate_cpe),
-    }
+    try:
+        conf = {
+            "generate_sbom": True,
+            "type": args.type,
+            "include_file_components": _parse_bool(args.include_file_components),
+            "include_file_dependencies": _parse_bool(args.include_file_dependencies),
+            "include_debug_files": _parse_bool(args.include_debug_files),
+            "include_man_pages": _parse_bool(args.include_man_pages),
+            "include_source_dependencies": _parse_bool(args.include_source_dependencies),
+            "include_toolchain_dependencies": _parse_bool(
+                args.include_toolchain_dependencies
+            ),
+            "generate_cpe": _parse_bool(args.generate_cpe),
+        }
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 1
 
     context = StandaloneContext(
-        rootdir=args.root,
+        rootdir=rootdir,
         resultdir=args.resultdir,
         mock_version=args.mock_version,
         mock_config=args.mock_config,
@@ -226,6 +321,7 @@ def main(argv=None):
         rpmbuild_networking=rpmbuild_networking,
         isolation=isolation,
         use_nspawn=use_nspawn,
+        builddir=args.builddir,
     )
     # Late import so argparse-manpage can load this module without rpm bindings.
     from mockbuild.sbom_generate import SBOMGenerator
@@ -238,7 +334,9 @@ def main(argv=None):
         prebuild_capture_errors=prebuild_capture_errors,
         prebuild_input_srpm=prebuild_input_srpm,
     )
-    generator.generate()
+    if not generator.generate():
+        log.error("SBOM generation failed; no SBOM artifact was written")
+        return 1
     return 0
 
 
