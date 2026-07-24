@@ -131,7 +131,26 @@ The plugin supports several configuration options to control SBOM generation:
 config_opts['plugin_conf']['sbom_generator_opts'] = {
     'generate_sbom': True,              # Enable SBOM generation (default: True)
     'type': 'cyclonedx',                # 'cyclonedx' or 'spdx'
-    'command': '/usr/bin/mock-sbom-generator',  # Standalone generator executable
+    # Full argv template. Placeholders are filled at postbuild; override this
+    # string to point at an external generator while Mock still injects paths.
+    'command': (
+        '/usr/bin/mock-sbom-generator'
+        ' --type %(type)s'
+        ' --resultdir %(resultdir)s'
+        ' --root %(root)s'
+        ' --builddir %(builddir)s'
+        ' --include-file-components %(include_file_components)s'
+        ' --include-file-dependencies %(include_file_dependencies)s'
+        ' --include-debug-files %(include_debug_files)s'
+        ' --include-man-pages %(include_man_pages)s'
+        ' --include-source-dependencies %(include_source_dependencies)s'
+        ' --include-toolchain-dependencies %(include_toolchain_dependencies)s'
+        ' --generate-cpe %(generate_cpe)s'
+        ' --online %(online)s'
+        ' --rpmbuild-networking %(rpmbuild_networking)s'
+        ' --isolation %(isolation)s'
+        ' --use-nspawn %(use_nspawn)s'
+    ),
     'generate_cpe': False,              # Heuristic CPE (default: False)
     'include_file_components': True,    # Include file-level components (default: True)
     'include_file_dependencies': False, # Include file-to-package dependencies (default: False)
@@ -157,7 +176,14 @@ toolchain.
 **Configuration Options Explained:**
 
 - `type`: SBOM format (`cyclonedx` or `spdx`).
-- `command`: Path to the `mock-sbom-generator` executable invoked by the plugin.
+- `command`: Full argv **template** for the generator (default embeds
+  `mock-sbom-generator` and its flags). Use Python `%(name)s` placeholders for
+  values Mock fills at postbuild (`type`, `resultdir`, `root`, `builddir`,
+  include_* / `generate_cpe`, and live network/isolation settings). Replace the
+  template to run an external tool while keeping path injection. Optional
+  provenance flags (`--prebuild-json`, `--mock-version`, `--mock-config`) are
+  appended by the plugin when available; `--mock-config` is a config **file**
+  path label for provenance, not an expanded config dump.
 - `generate_cpe`: When enabled, emit heuristic CPE identifiers labeled with
   `mock:cpe:confidence=heuristic` (default: `False` — off, to avoid false
   vulnerability matches from fabricated CPEs).

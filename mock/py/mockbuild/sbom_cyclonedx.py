@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # vim:expandtab:autoindent:tabstop=4:shiftwidth=4:filetype=python:textwidth=0:
-# License: GPL2 or later see COPYING
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Written by Scott R. Shinn <scott@atomicorp.com>
 # Copyright (C) 2026, Atomicorp, Inc.
 """

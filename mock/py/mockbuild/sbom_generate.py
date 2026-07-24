@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # vim:expandtab:autoindent:tabstop=4:shiftwidth=4:filetype=python:textwidth=0:
-# License: GPL2 or later see COPYING
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Written by Scott R. Shinn <scott@atomicorp.com>
 # Copyright (C) 2026, Atomicorp, Inc.
 """Core SBOM generation logic shared by the mock plugin and mock-sbom-generator."""
@@ -15,13 +15,10 @@ import socket
 import tempfile
 from datetime import datetime, timezone
 
-from mockbuild.trace_decorator import traceLog
-
 
 class SBOMGenerator:
     """Generates SBOM for the built packages."""
     # pylint: disable=too-few-public-methods,too-many-instance-attributes
-    @traceLog()
     def __init__(self, conf, buildroot, prebuild_source_files=None, prebuild_spec_metadata=None,
                  prebuild_capture_errors=None, prebuild_input_srpm=None):
         """Create an SBOM generator.
@@ -708,7 +705,6 @@ class SBOMGenerator:
                 toolchain_components.append(component)
         return toolchain_components, toolchain_bom_refs
 
-    @traceLog()
     # pylint: disable=too-many-locals
     def generate(self):
         """Generate the SBOM artifact(s) into the result directory.

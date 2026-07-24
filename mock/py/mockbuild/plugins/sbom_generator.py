@@ -1,29 +1,68 @@
 # -*- coding: utf-8 -*-
 # vim:expandtab:autoindent:tabstop=4:shiftwidth=4:filetype=python:textwidth=0:
-# License: GPL2 or later see COPYING
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Written by Scott R. Shinn <scott@atomicorp.com>
 # Copyright (C) 2026, Atomicorp, Inc.
 """Mock plugin that invokes mock-sbom-generator after a successful build."""
 
 import json
 import os
+import shlex
 
 from mockbuild.sbom_utils import RpmQueryHelper
-from mockbuild.trace_decorator import traceLog
 import mockbuild.util
 
 # pylint: disable=invalid-name
 requires_api_version = "1.1"
 # pylint: enable=invalid-name
 
-DEFAULT_COMMAND = "/usr/bin/mock-sbom-generator"
+# Full argv template (rpkg_preprocessor-style). Users may replace this with an
+# external generator; dynamic Mock paths/env are substituted at postbuild.
+DEFAULT_COMMAND = (
+    "/usr/bin/mock-sbom-generator"
+    " --type %(type)s"
+    " --resultdir %(resultdir)s"
+    " --root %(root)s"
+    " --builddir %(builddir)s"
+    " --include-file-components %(include_file_components)s"
+    " --include-file-dependencies %(include_file_dependencies)s"
+    " --include-debug-files %(include_debug_files)s"
+    " --include-man-pages %(include_man_pages)s"
+    " --include-source-dependencies %(include_source_dependencies)s"
+    " --include-toolchain-dependencies %(include_toolchain_dependencies)s"
+    " --generate-cpe %(generate_cpe)s"
+    " --online %(online)s"
+    " --rpmbuild-networking %(rpmbuild_networking)s"
+    " --isolation %(isolation)s"
+    " --use-nspawn %(use_nspawn)s"
+)
+
 # Visible forensic artifact retained in the result directory
 PREBUILD_STATE_FILENAME = "sbom-prebuild.json"
 # Legacy hidden name from earlier builds (still accepted if present)
 LEGACY_PREBUILD_STATE_FILENAME = ".sbom-prebuild.json"
 
+_BOOL_OPTS = (
+    "include_file_components",
+    "include_file_dependencies",
+    "include_debug_files",
+    "include_man_pages",
+    "include_source_dependencies",
+    "include_toolchain_dependencies",
+    "generate_cpe",
+)
 
-@traceLog()
+_BOOL_DEFAULTS = {
+    "include_file_components": True,
+    "include_file_dependencies": False,
+    "include_debug_files": False,
+    "include_man_pages": True,
+    "include_source_dependencies": True,
+    "include_toolchain_dependencies": False,
+    "generate_cpe": False,
+}
+
+
 def init(plugins, conf, buildroot):
     """Initializes the SBOM generator plugin."""
     if "type" in conf and conf["type"] not in ("cyclonedx", "spdx"):
@@ -40,7 +79,6 @@ class SBOMGeneratorPlugin:
     """Thin plugin wrapper that captures prebuild state and calls the CLI tool."""
 
     # pylint: disable=too-few-public-methods
-    @traceLog()
     def __init__(self, plugins, conf, buildroot):
         self.buildroot = buildroot
         self.conf = conf
@@ -76,7 +114,6 @@ class SBOMGeneratorPlugin:
             )
         return None
 
-    @traceLog()
     def _capture_prebuild_state(self):
         """Captures pristine source artifacts before the build begins.
 
@@ -209,10 +246,19 @@ class SBOMGeneratorPlugin:
                 pass
 
     def _resolve_config_file(self):
-        """Return the primary mock config *file* path (not the config directory)."""
+        """Return the primary mock config file path for SBOM provenance.
+
+        Prefers ``config_opts['config_file']`` when set to an existing file.
+        This is a path label for forensic context, not a dump of the expanded
+        Mock configuration (see ``--debug-config`` / ``--debug-config-expanded``
+        on the Mock CLI for that).
+        """
         config = self.buildroot.config
-        # Prefer the full list of loaded config files; last non-site file is usually
-        # the chroot cfg the user selected.
+        config_file = config.get("config_file")
+        if config_file and os.path.isfile(str(config_file)):
+            return str(config_file)
+
+        # Fall back to the last non-site file from the include chain.
         paths = list(config.get("config_paths") or [])
         for candidate in reversed(paths):
             if not candidate:
@@ -222,13 +268,7 @@ class SBOMGeneratorPlugin:
                 continue
             if os.path.isfile(candidate):
                 return candidate
-        # Fallbacks
-        for key in ("config_file", "chroot_name"):
-            val = config.get(key)
-            if val and os.path.isfile(str(val)):
-                return str(val)
-        # config_path is the search directory (/etc/mock) — only use if a matching
-        # chroot cfg exists beneath it.
+
         config_dir = config.get("config_path")
         root = config.get("root") or config.get("chroot_name")
         if config_dir and root:
@@ -267,19 +307,10 @@ class SBOMGeneratorPlugin:
         env["use_nspawn"] = bool(use_nspawn)
         return env
 
-    def _append_build_env_args(self, cmd):
-        """Forward live Mock network/isolation settings into the generator CLI."""
-        env = self._build_env_snapshot()
-        cmd.extend(["--online", "true" if env["online"] else "false"])
-        cmd.extend([
-            "--rpmbuild-networking",
-            "true" if env["rpmbuild_networking"] else "false",
-        ])
-        cmd.extend(["--isolation", str(env["isolation"])])
-        cmd.extend([
-            "--use-nspawn",
-            "true" if env["use_nspawn"] else "false",
-        ])
+    @staticmethod
+    def _bool_cli(value):
+        """Format a boolean for mock-sbom-generator CLI flags."""
+        return "true" if value else "false"
 
     def _prebuild_json_path(self):
         """Return the prebuild JSON path, accepting the legacy hidden name."""
@@ -290,55 +321,58 @@ class SBOMGeneratorPlugin:
             return legacy
         return None
 
-    @traceLog()
+    def _command_substitution(self):
+        """Build the %-format map for the configured command template."""
+        env = self._build_env_snapshot()
+        mapping = {
+            "type": self.sbom_type,
+            "resultdir": self.buildroot.resultdir,
+            "root": self.buildroot.make_chroot_path(),
+            "builddir": self.buildroot.builddir,
+            "online": self._bool_cli(env["online"]),
+            "rpmbuild_networking": self._bool_cli(env["rpmbuild_networking"]),
+            "isolation": str(env["isolation"]),
+            "use_nspawn": self._bool_cli(env["use_nspawn"]),
+        }
+        for key in _BOOL_OPTS:
+            mapping[key] = self._bool_cli(
+                self.conf.get(key, _BOOL_DEFAULTS[key])
+            )
+        return mapping
+
+    def _build_generator_argv(self):
+        """Expand the command template and append optional provenance flags."""
+        try:
+            formatted = self.command % self._command_substitution()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid sbom_generator command template: {exc}"
+            ) from exc
+        cmd = shlex.split(formatted)
+
+        prebuild = self._prebuild_json_path()
+        if prebuild:
+            cmd.extend(["--prebuild-json", prebuild])
+
+        mock_version = self.buildroot.config.get("version")
+        if mock_version:
+            cmd.extend(["--mock-version", str(mock_version)])
+
+        config_file = self._resolve_config_file()
+        if config_file:
+            cmd.extend(["--mock-config", config_file])
+
+        return cmd
+
     def _run_sbom_generator(self):
-        """Invoke the standalone mock-sbom-generator executable."""
+        """Invoke the configured SBOM generator command."""
         if self.sbom_done or not self.sbom_enabled:
             return
 
         state_text = f"Generating {self.sbom_type.upper()} SBOM for built packages"
         self.state.start(state_text)
         try:
-            cmd = [
-                self.command,
-                "--type",
-                self.sbom_type,
-                "--resultdir",
-                self.buildroot.resultdir,
-                "--root",
-                self.buildroot.make_chroot_path(),
-                "--builddir",
-                self.buildroot.builddir,
-            ]
-            prebuild = self._prebuild_json_path()
-            if prebuild:
-                cmd.extend(["--prebuild-json", prebuild])
-
-            for key in (
-                "include_file_components",
-                "include_file_dependencies",
-                "include_debug_files",
-                "include_man_pages",
-                "include_source_dependencies",
-                "include_toolchain_dependencies",
-                "generate_cpe",
-            ):
-                if key in self.conf:
-                    flag = "--" + key.replace("_", "-")
-                    value = "true" if self.conf[key] else "false"
-                    cmd.extend([flag, value])
-
-            mock_version = self.buildroot.config.get("version")
-            if mock_version:
-                cmd.extend(["--mock-version", str(mock_version)])
-
-            config_file = self._resolve_config_file()
-            if config_file:
-                cmd.extend(["--mock-config", config_file])
-
-            # Critical build-environment datapoints for SBOM consumers
-            self._append_build_env_args(cmd)
-
+            cmd = self._build_generator_argv()
             self.buildroot.root_log.debug("Running SBOM generator: %s", " ".join(cmd))
             with self.buildroot.uid_manager:
                 mockbuild.util.do(cmd, shell=False)

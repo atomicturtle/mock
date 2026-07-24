@@ -1,7 +1,7 @@
 #!/usr/bin/python3 -tt
 # -*- coding: utf-8 -*-
 # vim:expandtab:autoindent:tabstop=4:shiftwidth=4:filetype=python:textwidth=0:
-# License: GPL2 or later see COPYING
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Written by Scott R. Shinn <scott@atomicorp.com>
 # Copyright (C) 2026, Atomicorp, Inc.
 # pylint: disable=invalid-name
@@ -90,7 +90,14 @@ class StandaloneContext:
         return host_path_to_chroot_path(host_path, self.rootdir)
 
     def doOutChroot(self, command, *args, **kwargs):  # pylint: disable=invalid-name,unused-argument
-        """Execute command on the host (standalone has no bootstrap chroot)."""
+        """Host-only stand-in for Mock's ``Buildroot.doOutChroot``.
+
+        The standalone CLI has no bootstrap chroot, so this runs ``command`` on
+        the host (typically ``rpm --root <target>``), matching the
+        package_state pattern. It is not a reimplementation meant for
+        bootstrap-native RPM; when Mock invokes the generator as a subprocess,
+        queries still use host/bootstrap ``rpm --root`` against ``--root``.
+        """
         shell = kwargs.pop("shell", False)
         return_stderr = kwargs.pop("returnStderr", False)
         env = os.environ.copy()
