@@ -20,7 +20,8 @@ class SBOMGenerator:
     """Generates SBOM for the built packages."""
     # pylint: disable=too-few-public-methods,too-many-instance-attributes
     def __init__(self, conf, buildroot, prebuild_source_files=None, prebuild_spec_metadata=None,
-                 prebuild_capture_errors=None, prebuild_input_srpm=None):
+                 prebuild_capture_errors=None, prebuild_input_srpm=None,
+                 injected_host_properties=None, injected_hardening_properties=None):
         """Create an SBOM generator.
 
         Args:
@@ -30,6 +31,11 @@ class SBOMGenerator:
             prebuild_spec_metadata: Optional spec metadata captured before the build.
             prebuild_capture_errors: Optional list of prebuild capture failure messages.
             prebuild_input_srpm: Optional signed input SRPM metadata from originals/.
+            injected_host_properties: Optional host forensics captured on the Mock
+                host (hostname, SELinux, host distro, kernel) and passed in so
+                bootstrap execution does not re-query the wrong process context.
+            injected_hardening_properties: Optional hardening macro properties
+                captured on the Mock host via ``rpm --root`` (not bootstrap rpm).
         """
         self.buildroot = buildroot
         self.conf = conf or {}
@@ -47,6 +53,8 @@ class SBOMGenerator:
         self.prebuild_source_files = prebuild_source_files or []
         self.prebuild_spec_metadata = prebuild_spec_metadata or {}
         self.prebuild_capture_errors = list(prebuild_capture_errors or [])
+        self.injected_host_properties = list(injected_host_properties or [])
+        self.injected_hardening_properties = list(injected_hardening_properties or [])
         # Per-collector status for evidence-backed completeness
         self.collection_status = {}
         self.collection_errors = []
@@ -127,6 +135,53 @@ class SBOMGenerator:
 
         return props
 
+    def _effective_host_properties(self):
+        """Return host forensic properties, preferring host-injected values."""
+        if self.injected_host_properties:
+            return list(self.injected_host_properties)
+        return self._host_forensic_properties()
+
+    def _effective_hardening_properties(self):
+        """Return hardening properties, preferring host-injected values."""
+        if self.injected_hardening_properties:
+            # Macro evidence (not FIPS alone) marks the hardening collector OK.
+            macro_prop_names = {
+                "build:hardening:optflags",
+                "build:hardening:hardening_cflags",
+                "build:hardening:global_cflags",
+                "build:hardening:global_ldflags",
+                "build:hardening:build_ldflags",
+            }
+            if any(
+                p.get("name") in macro_prop_names
+                for p in self.injected_hardening_properties
+            ):
+                self._record_collector("hardening_macros", True)
+            else:
+                self._record_collector(
+                    "hardening_macros", False, "no hardening macros collected"
+                )
+            return list(self.injected_hardening_properties)
+        return self._collect_build_hardening_properties()
+
+    def collect_host_provenance(self):
+        """Capture host forensics and hardening macros on the Mock host.
+
+        Intended for the plugin process (not bootstrap). Hardening macros are
+        evaluated with the host ``rpm --root <target>`` so results are not
+        filtered through bootstrap's RPM personality.
+
+        Returns:
+            tuple: (host_metadata_properties, hardening_properties) lists of
+            ``{"name": ..., "value": ...}`` dicts suitable for prebuild JSON.
+        """
+        host_props = [
+            {"name": "mock:build:host", "value": socket.gethostname()},
+        ]
+        host_props.extend(self._host_forensic_properties())
+        hardening_props = self._collect_build_hardening_properties(via_host=True)
+        return host_props, hardening_props
+
     def _create_metadata(self):
         """Creates CycloneDX metadata object with Mock-specific build information."""
         metadata = {
@@ -166,10 +221,19 @@ class SBOMGenerator:
                 "value": "; ".join(self.collection_errors),
             })
 
-        properties.append({
-            "name": "mock:build:host",
-            "value": socket.gethostname()
-        })
+        # Host identity/forensics: prefer values captured on the Mock host
+        # (injected via prebuild JSON) so bootstrap execution does not record
+        # nspawn hostname / missing SELinux / wrong distro.
+        host_props = self._effective_host_properties()
+        hostname_injected = any(
+            p.get("name") == "mock:build:host" for p in host_props
+        )
+        if not hostname_injected:
+            properties.append({
+                "name": "mock:build:host",
+                "value": socket.gethostname()
+            })
+        properties.extend(host_props)
 
         distro_name = self.rpm_helper.get_distribution()
         if distro_name:
@@ -224,8 +288,6 @@ class SBOMGenerator:
                     "value": str(use_nspawn).lower()
                 })
 
-        properties.extend(self._host_forensic_properties())
-
         # buildroot_lock provenance when available (optional — absence is not an error)
         lock = self.rpm_helper.load_buildroot_lock()
         if lock:
@@ -246,7 +308,7 @@ class SBOMGenerator:
                     ),
                 })
 
-        hardening_props = self._collect_build_hardening_properties()
+        hardening_props = self._effective_hardening_properties()
         if hardening_props:
             properties.extend(hardening_props)
 
@@ -267,6 +329,41 @@ class SBOMGenerator:
             })
 
         return metadata
+
+    def _evaluate_rpm_macro_on_host(self, macro):
+        """Evaluate an RPM macro with the host ``rpm`` binary and ``--root``.
+
+        Unlike :meth:`_evaluate_rpm_macro`, this never uses ``doOutChroot``, so
+        bootstrap's RPM personality cannot under-report target macros. Call
+        only from the Mock host process when capturing injectable provenance.
+        """
+        chrootpath = None
+        if hasattr(self.buildroot, "make_chroot_path"):
+            chrootpath = self.buildroot.make_chroot_path()
+        elif getattr(self.buildroot, "rootdir", None):
+            chrootpath = self.buildroot.rootdir
+
+        if not chrootpath or not self.rpm_helper._usable_buildroot(chrootpath):
+            self.buildroot.root_log.debug(
+                "[SBOM] Skipping host RPM macro %s without a buildroot", macro
+            )
+            return ""
+
+        cmd = ["rpm", "--root", chrootpath, "--eval", macro]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                text=True,
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as exc:
+            self.buildroot.root_log.debug(
+                "Warning: failed to eval macro %s on host: %s", macro, exc
+            )
+            return ""
 
     def _evaluate_rpm_macro(self, macro):
         """Evaluate an RPM macro via host/bootstrap rpm with --root (doOutChroot).
@@ -347,7 +444,7 @@ class SBOMGenerator:
             return False
         return any(pos in token_set for pos in positives)
 
-    def _collect_build_hardening_properties(self):
+    def _collect_build_hardening_properties(self, via_host=False):
         """
         Capture key compiler/linker macro settings that influence hardening
         (FORTIFY, PIE, RELRO, LTO, etc.) and expose them as SBOM properties.
@@ -355,6 +452,11 @@ class SBOMGenerator:
         Feature/FIPS true/false bits are only emitted when at least one
         corresponding evidence source was successfully read. Missing evidence
         is omitted (unknown), not reported as false.
+
+        Args:
+            via_host (bool): When True, evaluate macros with the host ``rpm``
+                binary only (skip ``doOutChroot``). Use for host-side capture
+                before injecting into bootstrap SBOM generation.
         """
         macro_queries = {
             "build:hardening:optflags": "%{?optflags}",
@@ -364,11 +466,15 @@ class SBOMGenerator:
             "build:hardening:build_ldflags": "%{?build_ldflags}",
         }
 
+        eval_macro = (
+            self._evaluate_rpm_macro_on_host if via_host else self._evaluate_rpm_macro
+        )
+
         properties = []
         macro_values = {}
         macro_evidence = False
         for prop_name, macro in macro_queries.items():
-            value = self._evaluate_rpm_macro(macro)
+            value = eval_macro(macro)
             macro_values[prop_name] = value
             if value:
                 macro_evidence = True
@@ -788,7 +894,7 @@ class SBOMGenerator:
                 )
                 out_file = os.path.join(self.buildroot.resultdir, sbom_filename)
 
-                hardening_props = self._collect_build_hardening_properties()
+                hardening_props = self._effective_hardening_properties()
                 # Include network props in SPDX annotations via hardening_props list
                 if hasattr(self.buildroot, "config") and self.buildroot.config:
                     cfg = self.buildroot.config

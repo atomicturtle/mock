@@ -243,6 +243,8 @@ def main(argv=None):
     prebuild_spec_metadata = {}
     prebuild_capture_errors = []
     prebuild_input_srpm = None
+    injected_host_properties = []
+    injected_hardening_properties = []
     build_env = {}
     if args.prebuild_json:
         try:
@@ -261,6 +263,8 @@ def main(argv=None):
             ("spec_metadata", dict, "object"),
             ("capture_errors", list, "list"),
             ("build_env", dict, "object"),
+            ("host_metadata_properties", list, "list"),
+            ("hardening_properties", list, "list"),
         ):
             if key not in state or state.get(key) is None:
                 continue
@@ -274,7 +278,22 @@ def main(argv=None):
         prebuild_spec_metadata = state.get("spec_metadata") or {}
         prebuild_capture_errors = state.get("capture_errors") or []
         prebuild_input_srpm = state.get("input_srpm")
+        injected_host_properties = state.get("host_metadata_properties") or []
+        injected_hardening_properties = state.get("hardening_properties") or []
         build_env = state.get("build_env") or {}
+
+        for label, props in (
+            ("host_metadata_properties", injected_host_properties),
+            ("hardening_properties", injected_hardening_properties),
+        ):
+            for idx, entry in enumerate(props):
+                if not isinstance(entry, dict) or "name" not in entry or "value" not in entry:
+                    log.error(
+                        "Prebuild JSON %s[%d] must be "
+                        "{\"name\": ..., \"value\": ...}: %s",
+                        label, idx, args.prebuild_json,
+                    )
+                    return 1
 
     def _cli_bool(raw, flag_name):
         try:
@@ -340,6 +359,8 @@ def main(argv=None):
         prebuild_spec_metadata=prebuild_spec_metadata,
         prebuild_capture_errors=prebuild_capture_errors,
         prebuild_input_srpm=prebuild_input_srpm,
+        injected_host_properties=injected_host_properties,
+        injected_hardening_properties=injected_hardening_properties,
     )
     if not generator.generate():
         log.error("SBOM generation failed; no SBOM artifact was written")

@@ -9,8 +9,10 @@ This plugin generates a Software Bill of Materials (SBOM) in CycloneDX and SPDX 
 
 * Generates SBOM in CycloneDX 1.6 format (JSON) and SPDX 2.3 format
 * Deep Chroot Integration:
-  * Queries the target RPM database via host/bootstrap `rpm --root` using `doOutChroot`
-    (same pattern as `package_state` / `buildroot_lock`), avoiding fragile in-chroot RPM.
+  * With bootstrap enabled, postbuild runs the host-trusted generator **inside
+    bootstrap** via `doOutChroot` (bootstrap-native `rpm` / `python3-rpm`), with
+    the target root queried via `--root` — never executed in the target buildroot.
+  * With `use_bootstrap=False`, the generator runs on the host (same CLI).
   * Correctly handles path mapping between chroot and host environments.
 * Captures detailed information about:
   * Source files and patches from spec files with a resilient regex-based fallback for legacy/strict syntax errors.
@@ -184,6 +186,9 @@ toolchain.
   provenance flags (`--prebuild-json`, `--mock-version`, `--mock-config`) are
   appended by the plugin when available; `--mock-config` is a config **file**
   path label for provenance, not an expanded config dump.
+  With bootstrap enabled, a host absolute `argv[0]` is bind-mounted into
+  bootstrap for the run (or the default generator is copied under
+  `/usr/libexec/mock-sbom/`). Paths inside the **target** buildroot are refused.
 - `generate_cpe`: When enabled, emit heuristic CPE identifiers labeled with
   `mock:cpe:confidence=heuristic` (default: `False` — off, to avoid false
   vulnerability matches from fabricated CPEs).
@@ -406,14 +411,25 @@ CPE identifiers are included only when `generate_cpe` is enabled.
 
 * The plugin captures ``sbom-prebuild.json`` in a prebuild hook (sources/spec
   snapshot), then generates the SBOM in the ``postbuild`` hook after the build
-  completes.
+  completes. At postbuild the plugin also injects host forensics
+  (``host_metadata_properties``: hostname, SELinux, host distro/kernel) and
+  hardening macro properties (``hardening_properties``, via host
+  ``rpm --root``) into that JSON so bootstrap execution does not under-report
+  them.
 * SBOM generation is skipped if no RPM, source RPM, or spec file is found.
 * **Best-effort postbuild**: if SBOM generation fails, Mock logs a warning and
   the package build still succeeds. The standalone `mock-sbom-generator` CLI
   exits non-zero on failure.
-* **Hybrid Analysis**: Uses host/bootstrap `doOutChroot` (typically
-  `rpm --root` against the target chroot) for chroot queries, and host tools
-  for artifacts already exported to the `result/` directory.
+* **Trust boundary**: Host supplies the generator binary/modules; bootstrap
+  (or host if bootstrap is off) executes them with native `rpm`; the target
+  buildroot is queried only via `--root` and never runs the generator.
+  Host policy/hardening attestation is captured on the Mock host and passed
+  into the generator; RPM inventory and signature checks still use bootstrap
+  (or host) native `rpm`.
+* **Bootstrap execution**: Postbuild copies the host-trusted tool into
+  `/usr/libexec/mock-sbom/` inside bootstrap, bind-mounts `resultdir`, and runs
+  via `doOutChroot`. Bootstrap may install `python3` / `python3-rpm` for that
+  purpose.
 * **Resilient Parsing**: Includes a regex-based fallback for spec files that fail strict parsing by the `specfile` library (e.g., legacy `%patchN` syntax).
 * **PURL format**: `pkg:rpm/{distro}/{package}@{version}?arch={arch}`. Architecture is always separated into a qualifier, never baked into the version string.
 * Mock-specific metadata is stored in properties with the `mock:` prefix.

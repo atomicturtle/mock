@@ -5,21 +5,30 @@
 # Copyright (C) 2026, Atomicorp, Inc.
 """Mock plugin that invokes mock-sbom-generator after a successful build."""
 
+import glob
 import json
 import os
 import shlex
+import shutil
+import sys
+from contextlib import ExitStack, contextmanager
 
+from mockbuild.mounts import BindMountPoint
 from mockbuild.sbom_utils import RpmQueryHelper
+import mockbuild.file_util
 import mockbuild.util
 
 # pylint: disable=invalid-name
 requires_api_version = "1.1"
 # pylint: enable=invalid-name
 
+# Host path for the packaged generator (also the default command argv[0]).
+DEFAULT_GENERATOR_PATH = "/usr/bin/mock-sbom-generator"
+
 # Full argv template (rpkg_preprocessor-style). Users may replace this with an
 # external generator; dynamic Mock paths/env are substituted at postbuild.
 DEFAULT_COMMAND = (
-    "/usr/bin/mock-sbom-generator"
+    f"{DEFAULT_GENERATOR_PATH}"
     " --type %(type)s"
     " --resultdir %(resultdir)s"
     " --root %(root)s"
@@ -35,6 +44,21 @@ DEFAULT_COMMAND = (
     " --rpmbuild-networking %(rpmbuild_networking)s"
     " --isolation %(isolation)s"
     " --use-nspawn %(use_nspawn)s"
+)
+
+# Staged location inside the bootstrap chroot (host-trusted copy, never target).
+BOOTSTRAP_SBOM_LIBEXEC = "/usr/libexec/mock-sbom"
+BOOTSTRAP_SBOM_SCRIPT = f"{BOOTSTRAP_SBOM_LIBEXEC}/mock-sbom-generator"
+
+# Host-side modules copied into bootstrap under BOOTSTRAP_SBOM_LIBEXEC/mockbuild/.
+_BOOTSTRAP_MODULE_FILES = (
+    "__init__.py",
+    "exception.py",
+    "installed_packages.py",
+    "sbom_cyclonedx.py",
+    "sbom_generate.py",
+    "sbom_spdx.py",
+    "sbom_utils.py",
 )
 
 # Visible forensic artifact retained in the result directory
@@ -321,6 +345,52 @@ class SBOMGeneratorPlugin:
             return legacy
         return None
 
+    def _inject_host_provenance(self):
+        """Capture host forensics + hardening macros on the Mock host.
+
+        Writes ``host_metadata_properties`` and ``hardening_properties`` into
+        ``sbom-prebuild.json`` so the generator (which may run in bootstrap)
+        does not re-query getenforce/distro/hostname or evaluate macros with
+        bootstrap's RPM personality.
+        """
+        # Late import from the same mockbuild tree this plugin file lives in
+        # (plugin_dir / in-tree), not a possibly-stale site-packages copy.
+        sbom_generator_cls = self._load_sbom_generator_class()
+
+        path = self._prebuild_json_path() or self.prebuild_state_path
+        state = {}
+        if path and os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    state = loaded
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                self.buildroot.root_log.warning(
+                    "[SBOM] Could not load prebuild JSON for host provenance: %s",
+                    exc,
+                )
+
+        try:
+            # Use the live Buildroot so host rpm --root sees the target macros.
+            gen = sbom_generator_cls(self.conf, self.buildroot)
+            host_props, hardening_props = gen.collect_host_provenance()
+            state["host_metadata_properties"] = host_props
+            state["hardening_properties"] = hardening_props
+            os.makedirs(self.buildroot.resultdir, exist_ok=True)
+            with open(self.prebuild_state_path, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, indent=2)
+            self.buildroot.root_log.debug(
+                "[SBOM] Injected %d host + %d hardening properties into %s",
+                len(host_props),
+                len(hardening_props),
+                self.prebuild_state_path,
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            self.buildroot.root_log.warning(
+                "[SBOM] Failed to capture host provenance for SBOM: %s", exc
+            )
+
     def _command_substitution(self):
         """Build the %-format map for the configured command template."""
         env = self._build_env_snapshot()
@@ -364,18 +434,253 @@ class SBOMGeneratorPlugin:
 
         return cmd
 
+    def _path_in_target_root(self, path):
+        """Return True if path resolves inside the target buildroot."""
+        if not path:
+            return False
+        try:
+            real = os.path.realpath(path)
+            target = os.path.realpath(self.buildroot.make_chroot_path())
+        except OSError:
+            return False
+        return real == target or real.startswith(target + os.sep)
+
+    def _host_mockbuild_dir(self):
+        """Directory containing the host mockbuild package (trusted source).
+
+        Prefer the package that contains this plugin file so ``plugin_dir`` /
+        in-tree testing stages matching modules, not a stale site-packages copy.
+        """
+        here = os.path.dirname(os.path.realpath(__file__))
+        pkg = os.path.dirname(here)
+        if os.path.isfile(os.path.join(pkg, "sbom_generate.py")):
+            return pkg
+        import mockbuild as mockbuild_pkg  # pylint: disable=import-outside-toplevel
+        return os.path.dirname(os.path.realpath(mockbuild_pkg.__file__))
+
+    def _host_generator_script(self):
+        """Path to the host mock-sbom-generator script."""
+        # Prefer the script next to the mockbuild package we will stage (in-tree
+        # checkout). Fall back to the packaged /usr/bin path for installed RPMs.
+        candidate = os.path.join(
+            os.path.dirname(self._host_mockbuild_dir()), "mock-sbom-generator.py"
+        )
+        if os.path.isfile(candidate):
+            return candidate
+        if os.path.isfile(DEFAULT_GENERATOR_PATH):
+            return DEFAULT_GENERATOR_PATH
+        return DEFAULT_GENERATOR_PATH
+
+    def _load_sbom_generator_class(self):
+        """Load SBOMGenerator from the same mockbuild tree this plugin uses."""
+        import importlib.util  # pylint: disable=import-outside-toplevel
+
+        mod_path = os.path.join(self._host_mockbuild_dir(), "sbom_generate.py")
+        spec = importlib.util.spec_from_file_location(
+            "mockbuild_sbom_generate_hostinj", mod_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load SBOM generator from {mod_path}")
+        module = importlib.util.module_from_spec(spec)
+        # Ensure sibling mockbuild imports resolve when the module loads.
+        pkg_parent = os.path.dirname(self._host_mockbuild_dir())
+        if pkg_parent not in sys.path:
+            sys.path.insert(0, pkg_parent)
+        spec.loader.exec_module(module)
+        return module.SBOMGenerator
+
+    def _bootstrap_python_deps(self):
+        """Ensure python3 + python3-rpm exist in bootstrap (never the target)."""
+        bootstrap = self.buildroot.bootstrap_buildroot
+        if not bootstrap:
+            return
+
+        need = []
+        if not os.path.isfile(bootstrap.make_chroot_path("usr", "bin", "python3")):
+            need.append("python3")
+        rpm_paths = glob.glob(
+            bootstrap.make_chroot_path("usr", "lib*", "python*", "site-packages", "rpm")
+        )
+        if not rpm_paths:
+            need.append("python3-rpm")
+        if not need:
+            return
+
+        self.buildroot.root_log.info(
+            "Installing SBOM generator dependencies into bootstrap: %s",
+            ", ".join(need),
+        )
+        try:
+            bootstrap.install_as_root(*need)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            self.buildroot.root_log.warning(
+                "Failed installing SBOM bootstrap deps %s: %s", need, exc
+            )
+
+    def _stage_generator_into_bootstrap(self):
+        """Copy the host-trusted generator + modules into bootstrap libexec.
+
+        Returns the in-bootstrap path to the staged script (chroot-absolute).
+        """
+        bootstrap = self.buildroot.bootstrap_buildroot
+        host_pkg = self._host_mockbuild_dir()
+        host_script = self._host_generator_script()
+        if not os.path.isfile(host_script):
+            raise FileNotFoundError(
+                f"Host SBOM generator not found at {host_script}"
+            )
+
+        stage_root = bootstrap.make_chroot_path(BOOTSTRAP_SBOM_LIBEXEC.lstrip("/"))
+        stage_pkg = os.path.join(stage_root, "mockbuild")
+        mockbuild.file_util.mkdirIfAbsent(stage_pkg)
+
+        for name in _BOOTSTRAP_MODULE_FILES:
+            src = os.path.join(host_pkg, name)
+            if not os.path.isfile(src):
+                raise FileNotFoundError(f"Missing host mockbuild module: {src}")
+            shutil.copy2(src, os.path.join(stage_pkg, name))
+
+        staged_script = bootstrap.make_chroot_path(
+            BOOTSTRAP_SBOM_SCRIPT.lstrip("/")
+        )
+        shutil.copy2(host_script, staged_script)
+        os.chmod(staged_script, 0o755)
+        self.buildroot.root_log.debug(
+            "Staged host-trusted SBOM generator into bootstrap at %s",
+            BOOTSTRAP_SBOM_SCRIPT,
+        )
+        return BOOTSTRAP_SBOM_SCRIPT
+
+    @contextmanager
+    def _with_resultdir_in_bootstrap(self):
+        """Bind-mount resultdir into bootstrap so the generator can write SBOMs."""
+        bootstrap = self.buildroot.bootstrap_buildroot
+        resultdir = self.buildroot.resultdir
+        if not bootstrap or not resultdir:
+            yield
+            return
+        bootstrap_resultdir = bootstrap.make_chroot_path(resultdir)
+        mount = BindMountPoint(resultdir, bootstrap_resultdir, options="private")
+        with mount.having_mounted():
+            yield
+
+    @contextmanager
+    def _with_host_binary_in_bootstrap(self, host_path):
+        """Bind-mount a host generator binary into bootstrap at the same path."""
+        bootstrap = self.buildroot.bootstrap_buildroot
+        if not bootstrap or not host_path or not os.path.isfile(host_path):
+            yield
+            return
+        bindpath = bootstrap.make_chroot_path(host_path)
+        mount = BindMountPoint(host_path, bindpath, options="private")
+        with mount.having_mounted():
+            yield
+
+    def _prepare_bootstrap_argv(self, cmd):
+        """Rewrite argv for bootstrap execution; return (argv, host_binds).
+
+        ``host_binds`` is a list of host absolute paths to bind-mount into
+        bootstrap for the duration of the run (custom external generators).
+        """
+        if not cmd:
+            raise ValueError("SBOM generator command is empty")
+
+        argv0 = cmd[0]
+        if self._path_in_target_root(argv0):
+            raise ValueError(
+                "SBOM generator command must not point inside the target "
+                f"buildroot (refusing {argv0!r} for supply-chain safety)"
+            )
+
+        host_binds = []
+        use_default = (
+            argv0 == DEFAULT_GENERATOR_PATH
+            or os.path.realpath(argv0) == os.path.realpath(self._host_generator_script())
+        )
+
+        if use_default:
+            staged = self._stage_generator_into_bootstrap()
+            # env prefix so bootstrap python finds the staged mockbuild package.
+            argv = [
+                "/usr/bin/env",
+                f"PYTHONPATH={BOOTSTRAP_SBOM_LIBEXEC}",
+                staged,
+            ] + list(cmd[1:])
+            return argv, host_binds
+
+        # External generator: bind-mount host binary if it exists on the host.
+        if os.path.isabs(argv0) and os.path.isfile(argv0):
+            host_binds.append(os.path.realpath(argv0))
+        return list(cmd), host_binds
+
+    def _run_sbom_generator_on_host(self, cmd):
+        """Run the generator as a host process (bootstrap disabled)."""
+        with self.buildroot.uid_manager:
+            mockbuild.util.do(cmd, shell=False)
+
+    def _fix_sbom_result_ownership(self):
+        """Chown SBOM artifacts in resultdir to the invoking (unprivileged) user.
+
+        Bootstrap ``doOutChroot`` runs as root, so without this the ``*.sbom``
+        files are root-owned mode 0600 and unreadable to the Mock caller.
+        """
+        resultdir = self.buildroot.resultdir
+        if not resultdir or not os.path.isdir(resultdir):
+            return
+        uid = self.buildroot.uid_manager.unprivUid
+        gid = self.buildroot.uid_manager.unprivGid
+        suffixes = (".sbom", ".sbom.sha256", ".spdx.json")
+        for name in os.listdir(resultdir):
+            if not name.endswith(suffixes):
+                continue
+            path = os.path.join(resultdir, name)
+            try:
+                os.chown(path, uid, gid)
+                os.chmod(path, 0o644)
+            except OSError as exc:
+                self.buildroot.root_log.debug(
+                    "Could not fix ownership of %s: %s", path, exc
+                )
+
+    def _run_sbom_generator_in_bootstrap(self, cmd):
+        """Stage host-trusted tool into bootstrap and run via doOutChroot."""
+        with self.buildroot.uid_manager.elevated_privileges():
+            self._bootstrap_python_deps()
+            argv, host_binds = self._prepare_bootstrap_argv(cmd)
+            self.buildroot.root_log.info(
+                "Running SBOM generator in bootstrap: %s", " ".join(argv)
+            )
+            with ExitStack() as stack:
+                stack.enter_context(self._with_resultdir_in_bootstrap())
+                for host_path in host_binds:
+                    stack.enter_context(self._with_host_binary_in_bootstrap(host_path))
+                # doOutChroot mounts the target root and runs in bootstrap.
+                self.buildroot.doOutChroot(argv, shell=False, printOutput=True)
+            self._fix_sbom_result_ownership()
+
     def _run_sbom_generator(self):
-        """Invoke the configured SBOM generator command."""
+        """Invoke the configured SBOM generator command.
+
+        With bootstrap enabled, the host-trusted generator is copied into
+        bootstrap and executed via ``doOutChroot`` (native bootstrap rpm).
+        The generator is never installed into or run from the target buildroot.
+        When bootstrap is off, the generator runs on the host.
+        """
         if self.sbom_done or not self.sbom_enabled:
             return
 
         state_text = f"Generating {self.sbom_type.upper()} SBOM for built packages"
         self.state.start(state_text)
         try:
+            # Capture host forensics / hardening before bootstrap exec so the
+            # generator can prefer injected properties over in-bootstrap queries.
+            self._inject_host_provenance()
             cmd = self._build_generator_argv()
             self.buildroot.root_log.debug("Running SBOM generator: %s", " ".join(cmd))
-            with self.buildroot.uid_manager:
-                mockbuild.util.do(cmd, shell=False)
+            if self.buildroot.bootstrap_buildroot:
+                self._run_sbom_generator_in_bootstrap(cmd)
+            else:
+                self._run_sbom_generator_on_host(cmd)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             # Best-effort forensic step: never fail the Mock build over SBOM.
             self.buildroot.root_log.warning("SBOM generation failed: %s", exc)
