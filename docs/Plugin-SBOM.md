@@ -17,7 +17,7 @@ This plugin generates a Software Bill of Materials (SBOM) in CycloneDX and SPDX 
 * Captures detailed information about:
   * Source files and patches from spec files with a resilient regex-based fallback for legacy/strict syntax errors.
   * Binary RPM metadata with standard PURL identifiers, and CPE identifiers
-    when ``generate_cpe`` is enabled.
+    when ``--generate-cpe`` is enabled in the generator command.
   * Build toolchain packages with per-package GPG signature metadata when
     available (best-effort; see ``sbom:completeness`` and collection errors).
   * Runtime dependencies.
@@ -127,40 +127,57 @@ config_opts['plugin_conf']['sbom_generator_enable'] = True
 
 ### Configuration Options
 
-The plugin supports several configuration options to control SBOM generation:
+The plugin has two options. Generator behavior (format, includes, CPE, …) is
+controlled by editing the ``command`` string — so a different host SBOM tool can
+be plugged in without new Mock config keys.
 
 ```python
 config_opts['plugin_conf']['sbom_generator_opts'] = {
     'generate_sbom': True,              # Enable SBOM generation (default: True)
-    'type': 'cyclonedx',                # 'cyclonedx' or 'spdx'
-    # Full argv template. Placeholders are filled at postbuild; override this
-    # string to point at an external generator while Mock still injects paths.
+    # Full argv template. Generator flags are literal defaults; override this
+    # string to change format/includes or to point at an external generator.
+    # Mock fills only path/runtime placeholders at postbuild.
     'command': (
         '/usr/bin/mock-sbom-generator'
-        ' --type %(type)s'
+        ' --type cyclonedx'
         ' --resultdir %(resultdir)s'
         ' --root %(root)s'
         ' --builddir %(builddir)s'
-        ' --include-file-components %(include_file_components)s'
-        ' --include-file-dependencies %(include_file_dependencies)s'
-        ' --include-debug-files %(include_debug_files)s'
-        ' --include-man-pages %(include_man_pages)s'
-        ' --include-source-dependencies %(include_source_dependencies)s'
-        ' --include-toolchain-dependencies %(include_toolchain_dependencies)s'
-        ' --generate-cpe %(generate_cpe)s'
+        ' --include-file-components true'
+        ' --include-file-dependencies false'
+        ' --include-debug-files false'
+        ' --include-man-pages true'
+        ' --include-source-dependencies true'
+        ' --include-toolchain-dependencies false'
+        ' --generate-cpe false'
         ' --online %(online)s'
         ' --rpmbuild-networking %(rpmbuild_networking)s'
         ' --isolation %(isolation)s'
         ' --use-nspawn %(use_nspawn)s'
     ),
-    'generate_cpe': False,              # Heuristic CPE (default: False)
-    'include_file_components': True,    # Include file-level components (default: True)
-    'include_file_dependencies': False, # Include file-to-package dependencies (default: False)
-    'include_debug_files': False,       # Include debug files in file components (default: False)
-    'include_man_pages': True,          # Include man pages in file components (default: True)
-    'include_source_dependencies': True,  # Primary dependsOn includes build inputs (default: True)
-    'include_toolchain_dependencies': False,  # Primary/package dependsOn includes toolchain (default: False)
 }
+```
+
+**Examples — customize via ``command``:**
+
+```python
+# SPDX instead of CycloneDX
+config_opts['plugin_conf']['sbom_generator_opts']['command'] = (
+    '/usr/bin/mock-sbom-generator'
+    ' --type spdx'
+    ' --resultdir %(resultdir)s'
+    ' --root %(root)s'
+    ' --builddir %(builddir)s'
+    ' --online %(online)s'
+    ' --rpmbuild-networking %(rpmbuild_networking)s'
+    ' --isolation %(isolation)s'
+    ' --use-nspawn %(use_nspawn)s'
+)
+
+# External generator (Mock still injects paths)
+config_opts['plugin_conf']['sbom_generator_opts']['command'] = (
+    '/usr/bin/my-sbom-tool --out %(resultdir)s --chroot %(root)s'
+)
 ```
 
 **Standalone usage (no Mock build required):**
@@ -177,33 +194,41 @@ toolchain.
 
 **Configuration Options Explained:**
 
-- `type`: SBOM format (`cyclonedx` or `spdx`).
+- `generate_sbom`: Enable or disable generation when the plugin is loaded
+  (default: `True`).
 - `command`: Full argv **template** for the generator (default embeds
-  `mock-sbom-generator` and its flags). Use Python `%(name)s` placeholders for
-  values Mock fills at postbuild (`type`, `resultdir`, `root`, `builddir`,
-  include_* / `generate_cpe`, and live network/isolation settings). Replace the
-  template to run an external tool while keeping path injection. Optional
-  provenance flags (`--prebuild-json`, `--mock-version`, `--mock-config`) are
-  appended by the plugin when available; `--mock-config` is a config **file**
-  path label for provenance, not an expanded config dump.
+  `mock-sbom-generator` with sensible literal flags). Use Python `%(name)s`
+  placeholders for values Mock fills at postbuild: `resultdir`, `root`,
+  `builddir`, and live network/isolation settings (`online`,
+  `rpmbuild_networking`, `isolation`, `use_nspawn`). Put generator-specific
+  flags (`--type`, `--include-*`, `--generate-cpe`, …) literally in the string
+  (or rely on CLI defaults). Replace the template to run an external tool while
+  keeping path injection. Optional provenance flags (`--prebuild-json`,
+  `--mock-version`, `--mock-config`) are appended by the plugin when available;
+  `--mock-config` is a config **file** path label for provenance, not an
+  expanded config dump.
   With bootstrap enabled, a host absolute `argv[0]` is bind-mounted into
   bootstrap for the run (or the default generator is copied under
   `/usr/libexec/mock-sbom/`). Paths inside the **target** buildroot are refused.
-- `generate_cpe`: When enabled, emit heuristic CPE identifiers labeled with
-  `mock:cpe:confidence=heuristic` (default: `False` — off, to avoid false
-  vulnerability matches from fabricated CPEs).
-- `include_file_components`: When enabled, creates individual file components for each file in built packages, including hashes, permissions, and ownership information.
-- `include_file_dependencies`: Creates dependency relationships showing which files belong to which packages.
-- `include_debug_files`: When `False` (default), debug files (`.debug`, paths under
-  `/usr/lib/debug`) are omitted from file components; set `True` to include them.
-- `include_man_pages`: When `False`, man/info pages are omitted from file
-  components; when `True` (default), they are included.
-- `include_source_dependencies`: When `True` (default), the primary component's
-  `dependsOn` list includes build-input source/patch bom-refs. Set `False` to
-  keep sources only in `components[]` / formulation inputs.
-- `include_toolchain_dependencies`: When `True`, adds build toolchain bom-refs to
-  package/`dependsOn` graphs (useful for complete build provenance, but can make
-  dependency graphs very large). Default `False`.
+
+**CLI flags on ``mock-sbom-generator``** (embed in ``command`` as needed):
+
+- `--type`: `cyclonedx` (default) or `spdx`.
+- `--generate-cpe`: Heuristic CPE identifiers labeled
+  `mock:cpe:confidence=heuristic` (default: off, to avoid false vulnerability
+  matches from fabricated CPEs).
+- `--include-file-components`: Individual file components with hashes,
+  permissions, and ownership (default: on).
+- `--include-file-dependencies`: File-to-package dependency relationships
+  (default: off).
+- `--include-debug-files`: Include `.debug` / `/usr/lib/debug` paths in file
+  components (default: off).
+- `--include-man-pages`: Include man/info pages in file components
+  (default: on).
+- `--include-source-dependencies`: Primary component `dependsOn` includes
+  build-input source/patch bom-refs (default: on).
+- `--include-toolchain-dependencies`: Add toolchain bom-refs to package
+  dependency graphs (default: off; can make graphs very large).
 
 ## Output
 
@@ -229,7 +254,7 @@ The plugin generates a file named `<name>-<version>-<release>.sbom` (for Cyclone
 * Components array containing:
   * Built packages (type: "library" or "application")
     * Package name, version, and PURL
-    * CPE identifiers for vulnerability matching (only when `generate_cpe` is enabled)
+    * CPE identifiers for vulnerability matching (only when `--generate-cpe` is enabled)
     * License information plus RPM summary as description
     * RPM file SHA-256 hash
     * Vendor, packager, buildhost, buildtime, source RPM, group, epoch, distribution metadata
@@ -399,7 +424,7 @@ The generated CycloneDX SBOM is compatible with popular security scanners:
 * **Snyk**: Supports CycloneDX format for vulnerability scanning
 
 The SBOM includes PURL (Package URL) identifiers for accurate package identity.
-CPE identifiers are included only when `generate_cpe` is enabled.
+CPE identifiers are included only when `--generate-cpe` is enabled in the generator command.
 
 ## Requirements
 

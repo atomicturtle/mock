@@ -25,21 +25,24 @@ requires_api_version = "1.1"
 # Host path for the packaged generator (also the default command argv[0]).
 DEFAULT_GENERATOR_PATH = "/usr/bin/mock-sbom-generator"
 
-# Full argv template (rpkg_preprocessor-style). Users may replace this with an
-# external generator; dynamic Mock paths/env are substituted at postbuild.
+# Full argv template (rpkg_preprocessor-style). Generator-specific flags are
+# literal defaults here; override the whole ``command`` string to change
+# format/includes or to point at an external tool. Mock only substitutes
+# path/runtime placeholders at postbuild: resultdir, root, builddir, online,
+# rpmbuild_networking, isolation, use_nspawn.
 DEFAULT_COMMAND = (
     f"{DEFAULT_GENERATOR_PATH}"
-    " --type %(type)s"
+    " --type cyclonedx"
     " --resultdir %(resultdir)s"
     " --root %(root)s"
     " --builddir %(builddir)s"
-    " --include-file-components %(include_file_components)s"
-    " --include-file-dependencies %(include_file_dependencies)s"
-    " --include-debug-files %(include_debug_files)s"
-    " --include-man-pages %(include_man_pages)s"
-    " --include-source-dependencies %(include_source_dependencies)s"
-    " --include-toolchain-dependencies %(include_toolchain_dependencies)s"
-    " --generate-cpe %(generate_cpe)s"
+    " --include-file-components true"
+    " --include-file-dependencies false"
+    " --include-debug-files false"
+    " --include-man-pages true"
+    " --include-source-dependencies true"
+    " --include-toolchain-dependencies false"
+    " --generate-cpe false"
     " --online %(online)s"
     " --rpmbuild-networking %(rpmbuild_networking)s"
     " --isolation %(isolation)s"
@@ -66,36 +69,9 @@ PREBUILD_STATE_FILENAME = "sbom-prebuild.json"
 # Legacy hidden name from earlier builds (still accepted if present)
 LEGACY_PREBUILD_STATE_FILENAME = ".sbom-prebuild.json"
 
-_BOOL_OPTS = (
-    "include_file_components",
-    "include_file_dependencies",
-    "include_debug_files",
-    "include_man_pages",
-    "include_source_dependencies",
-    "include_toolchain_dependencies",
-    "generate_cpe",
-)
-
-_BOOL_DEFAULTS = {
-    "include_file_components": True,
-    "include_file_dependencies": False,
-    "include_debug_files": False,
-    "include_man_pages": True,
-    "include_source_dependencies": True,
-    "include_toolchain_dependencies": False,
-    "generate_cpe": False,
-}
-
 
 def init(plugins, conf, buildroot):
     """Initializes the SBOM generator plugin."""
-    if "type" in conf and conf["type"] not in ("cyclonedx", "spdx"):
-        buildroot.root_log.warning(
-            "SBOM generator type '%s' not supported, defaulting to 'cyclonedx'",
-            conf["type"],
-        )
-        conf["type"] = "cyclonedx"
-
     SBOMGeneratorPlugin(plugins, conf, buildroot)
 
 
@@ -109,7 +85,6 @@ class SBOMGeneratorPlugin:
         self.rpm_helper = RpmQueryHelper(self.buildroot)
         self.state = buildroot.state
         self.sbom_enabled = self.conf.get("generate_sbom", True)
-        self.sbom_type = self.conf.get("type", "cyclonedx")
         self.command = self.conf.get("command", DEFAULT_COMMAND)
         self.sbom_done = False
         self.prebuild_state_path = os.path.join(
@@ -392,10 +367,13 @@ class SBOMGeneratorPlugin:
             )
 
     def _command_substitution(self):
-        """Build the %-format map for the configured command template."""
+        """Build the %-format map for Mock-owned command placeholders.
+
+        Generator-specific flags (``--type``, ``--include-*``, ``--generate-cpe``)
+        are not substituted from plugin opts; embed them literally in ``command``.
+        """
         env = self._build_env_snapshot()
-        mapping = {
-            "type": self.sbom_type,
+        return {
             "resultdir": self.buildroot.resultdir,
             "root": self.buildroot.make_chroot_path(),
             "builddir": self.buildroot.builddir,
@@ -404,11 +382,6 @@ class SBOMGeneratorPlugin:
             "isolation": str(env["isolation"]),
             "use_nspawn": self._bool_cli(env["use_nspawn"]),
         }
-        for key in _BOOL_OPTS:
-            mapping[key] = self._bool_cli(
-                self.conf.get(key, _BOOL_DEFAULTS[key])
-            )
-        return mapping
 
     def _build_generator_argv(self):
         """Expand the command template and append optional provenance flags."""
@@ -669,7 +642,7 @@ class SBOMGeneratorPlugin:
         if self.sbom_done or not self.sbom_enabled:
             return
 
-        state_text = f"Generating {self.sbom_type.upper()} SBOM for built packages"
+        state_text = "Generating SBOM for built packages"
         self.state.start(state_text)
         try:
             # Capture host forensics / hardening before bootstrap exec so the

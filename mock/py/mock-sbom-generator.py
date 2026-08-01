@@ -92,11 +92,20 @@ class StandaloneContext:
     def doOutChroot(self, command, *args, **kwargs):  # pylint: disable=invalid-name,unused-argument
         """Host-only stand-in for Mock's ``Buildroot.doOutChroot``.
 
-        The standalone CLI has no bootstrap chroot, so this runs ``command`` on
-        the host (typically ``rpm --root <target>``), matching the
-        package_state pattern. It is not a reimplementation meant for
-        bootstrap-native RPM; when Mock invokes the generator as a subprocess,
-        queries still use host/bootstrap ``rpm --root`` against ``--root``.
+        Execution model for SBOM generation:
+
+        * **(a) Host** — used when bootstrap is disabled (Mock plugin runs the
+          generator via ``util.do``) and always for this standalone CLI.
+        * **(b) Bootstrap** — preferred Mock plugin path: stage the host-trusted
+          tool into bootstrap and invoke it with real ``Buildroot.doOutChroot``
+          (native bootstrap rpm against the target ``--root``).
+        * **(c) Target chroot** — never used (supply-chain safety).
+
+        This method is only the duck-type for standalone mode (no bootstrap).
+        It runs ``command`` on the host (typically ``rpm --root <target>``),
+        matching package_state. When Mock invokes the generator as a subprocess
+        inside bootstrap, Mock's real ``doOutChroot`` is used instead — this
+        method is not in that call path.
         """
         shell = kwargs.pop("shell", False)
         return_stderr = kwargs.pop("returnStderr", False)

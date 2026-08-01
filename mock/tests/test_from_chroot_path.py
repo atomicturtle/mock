@@ -1,67 +1,32 @@
-""" Tests for from_chroot_path in buildroot.py """
+"""Tests for util.host_path_to_chroot_path."""
 
-import pytest
-from unittest.mock import MagicMock
-from mockbuild import buildroot
+from mockbuild.util import host_path_to_chroot_path
 
-def test_from_chroot_path():
-    """ test from_chroot_path method """
-    config = MagicMock()
-    uid_manager = MagicMock()
-    state = MagicMock()
-    plugins = MagicMock()
-    
-    # Mock config and rootdir
-    config_dict = {
-        'root': 'fedora-rawhide-x86_64',
-        'basedir': '/var/lib/mock',
-        'rootdir': '/var/lib/mock/fedora-rawhide-x86_64/root',
-        'resultdir': 'results',
-        'chroothome': '/builddir',
-        'cache_topdir': '/var/cache/mock',
-        'plugin_conf': {'selinux_enable': False},
-        'chrootuid': 1000,
-        'chrootuser': 'mockbuild',
-        'chrootgid': 1000,
-        'chrootgroup': 'mock',
-        'environment': {},
-        'use_buildroot_image': False,
-        'buildroot_image': None,
-        'buildroot_image_skip_pull': False,
-        'buildroot_image_keep_getting': False,
-        'additional_packages': [],
-        'version': '1.0',
-        'files': {},
-        'extra_chroot_dirs': [],
-        'macros': {},
-        'package_manager': 'dnf',
-        'tar_binary': 'tar',
-        'image_fallback': True,
-        'nspawn_args': [],
-        'rpm_command': 'rpm',
-        'unique-ext': 'none'
-    }
-    config.__getitem__.side_effect = lambda key: config_dict.get(key)
-    config.__contains__.side_effect = lambda key: key in config_dict
-    config.get.side_effect = lambda key, default=None: config_dict.get(key, default)
-    
-    # Initialize Buildroot
-    br = buildroot.Buildroot(config, uid_manager, state, plugins)
-    br.rootdir = "/var/lib/mock/fedora-rawhide-x86_64/root"
-    
-    # Test cases
-    host_path = "/var/lib/mock/fedora-rawhide-x86_64/root/builddir/build/SPECS/test.spec"
-    expected_chroot_path = "/builddir/build/SPECS/test.spec"
-    assert br.from_chroot_path(host_path) == expected_chroot_path
-    
-    # Test path not in rootdir
-    other_path = "/tmp/test.spec"
-    assert br.from_chroot_path(other_path) == other_path
-    
-    # Test rootdir without trailing slash
-    br.rootdir = "/myroot"
-    assert br.from_chroot_path("/myroot/etc/passwd") == "/etc/passwd"
-    
-    # Test rootdir with trailing slash (should handle it gracefully)
-    br.rootdir = "/myroot/"
-    assert br.from_chroot_path("/myroot/etc/passwd") == "/etc/passwd"
+
+def test_host_path_to_chroot_path():
+    """Boundary-safe host-to-chroot path conversion."""
+    rootdir = "/var/lib/mock/fedora-rawhide-x86_64/root"
+    host_path = (
+        "/var/lib/mock/fedora-rawhide-x86_64/root/builddir/build/SPECS/test.spec"
+    )
+    assert host_path_to_chroot_path(host_path, rootdir) == (
+        "/builddir/build/SPECS/test.spec"
+    )
+
+    # Path not under rootdir is unchanged.
+    assert host_path_to_chroot_path("/tmp/test.spec", rootdir) == "/tmp/test.spec"
+
+    # rootdir without trailing slash
+    assert host_path_to_chroot_path("/myroot/etc/passwd", "/myroot") == "/etc/passwd"
+
+    # rootdir with trailing slash
+    assert host_path_to_chroot_path("/myroot/etc/passwd", "/myroot/") == "/etc/passwd"
+
+    # Exact rootdir maps to "/"
+    assert host_path_to_chroot_path("/myroot", "/myroot") == "/"
+    assert host_path_to_chroot_path("/myroot/", "/myroot") == "/"
+
+    # Sibling prefix must not be treated as inside rootdir
+    assert host_path_to_chroot_path(
+        "/myroot-other/etc/passwd", "/myroot"
+    ) == "/myroot-other/etc/passwd"

@@ -273,17 +273,28 @@ def setup_default_config_opts():
         'sbom_generator_enable': False,
         'sbom_generator_opts': {
             'generate_sbom': True,
-            'type': 'cyclonedx',
-            'command': '/usr/bin/mock-sbom-generator',
-            'include_file_components': True,
-            'include_file_dependencies': False,
-            'include_debug_files': False,
-            'include_man_pages': True,
-            'include_source_dependencies': True,
-            'include_toolchain_dependencies': False,
-            # Heuristic CPEs are off by default; enable only if you accept
-            # fabricated identifiers labeled mock:cpe:confidence=heuristic.
-            'generate_cpe': False,
+            # Full argv template. Generator flags are literal; Mock substitutes
+            # only path/runtime placeholders (resultdir, root, builddir, online,
+            # rpmbuild_networking, isolation, use_nspawn). Override this string
+            # to change format/includes or to use an external generator.
+            'command': (
+                '/usr/bin/mock-sbom-generator'
+                ' --type cyclonedx'
+                ' --resultdir %(resultdir)s'
+                ' --root %(root)s'
+                ' --builddir %(builddir)s'
+                ' --include-file-components true'
+                ' --include-file-dependencies false'
+                ' --include-debug-files false'
+                ' --include-man-pages true'
+                ' --include-source-dependencies true'
+                ' --include-toolchain-dependencies false'
+                ' --generate-cpe false'
+                ' --online %(online)s'
+                ' --rpmbuild-networking %(rpmbuild_networking)s'
+                ' --isolation %(isolation)s'
+                ' --use-nspawn %(use_nspawn)s'
+            ),
         },
     }
 
